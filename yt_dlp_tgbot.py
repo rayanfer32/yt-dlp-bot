@@ -161,9 +161,9 @@ def check_cancel(data, chat_id, message, status_msg=None):
     if user_states.get(chat_id) == 'cancel':
         if status_msg:
             try:
-                status_msg.edit_text("🚫 Download cancelled by user.", reply_markup=ReplyKeyboardRemove())
-            except Exception:
-                pass
+                app.edit_message_text(chat_id, status_msg.id, "🚫 Download cancelled by user.")
+            except Exception as e:
+                print(f"Cancel status edit error: {e}")
         else:
             message.reply_text("Download cancelled by user.", reply_markup=ReplyKeyboardRemove())
         raise Exception("Download cancelled by user")
@@ -204,22 +204,29 @@ def download_video(client, message):
 
             progress_state = {
                 'last_update': 0,
+                'last_percent': -1,
                 'start_time': time.time()
             }
 
             def ydl_progress_hook(d):
                 check_cancel(d, chat_id, message, status_msg)
                 if d.get('status') == 'downloading':
-                    now = time.time()
-                    if now - progress_state['last_update'] < 3.5:
-                        return
-
                     total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
                     downloaded = d.get('downloaded_bytes', 0)
+                    percent = (downloaded / total * 100) if total > 0 else 0.0
+
+                    now = time.time()
+                    time_diff = now - progress_state['last_update']
+                    percent_diff = abs(percent - progress_state['last_percent'])
+
+                    # Update if at least 1.5s has passed, or if progress changed by >= 5% (min 0.8s between edits)
+                    if progress_state['last_update'] != 0 and time_diff < 1.5 and percent_diff < 5.0 and downloaded != total:
+                        return
+                    if progress_state['last_update'] != 0 and time_diff < 0.8:
+                        return
+
                     speed = d.get('speed') or 0
                     eta = d.get('eta')
-
-                    percent = (downloaded / total * 100) if total > 0 else 0.0
                     bar = make_progress_bar(percent)
 
                     total_str = format_size(total) if total > 0 else "Unknown"
@@ -235,19 +242,25 @@ def download_video(client, message):
                     )
 
                     try:
-                        status_msg.edit_text(text)
+                        app.edit_message_text(chat_id, status_msg.id, text)
                         progress_state['last_update'] = now
+                        progress_state['last_percent'] = percent
                     except FloodWait as fw:
                         time.sleep(fw.value)
                     except MessageNotModified:
                         pass
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        print(f"Download progress edit error: {e}")
+
                 elif d.get('status') == 'finished':
                     try:
-                        status_msg.edit_text("⚙️ Processing video file...")
-                    except Exception:
-                        pass
+                        app.edit_message_text(
+                            chat_id,
+                            status_msg.id,
+                            "⚙️ **Download finished, processing video file...**"
+                        )
+                    except Exception as e:
+                        print(f"Finished edit error: {e}")
 
             # Attempt to download the video using yt-dlp
             try:
@@ -268,7 +281,11 @@ def download_video(client, message):
                         # Check if the file size is greater than 2GB
                         if file_size > 2 * 1024 * 1024 * 1024:  # 2GB in bytes
                             try:
-                                status_msg.edit_text("❌ Error: The downloaded video is too large to be sent via Telegram (> 2GB).", reply_markup=ReplyKeyboardRemove())
+                                app.edit_message_text(
+                                    chat_id,
+                                    status_msg.id,
+                                    "❌ Error: The downloaded video is too large to be sent via Telegram (> 2GB)."
+                                )
                             except Exception:
                                 message.reply_text("Error: The downloaded video is too large to be sent via Telegram.", reply_markup=ReplyKeyboardRemove())
                             os.remove(full_path)  # Remove the large file
@@ -276,19 +293,25 @@ def download_video(client, message):
 
                         upload_state = {
                             'last_update': 0,
+                            'last_percent': -1,
                             'start_time': time.time()
                         }
 
                         def upload_progress_hook(current, total):
+                            percent = (current / total * 100) if total > 0 else 0.0
                             now = time.time()
-                            if now - upload_state['last_update'] < 3.5 and current != total:
+                            time_diff = now - upload_state['last_update']
+                            percent_diff = abs(percent - upload_state['last_percent'])
+
+                            if upload_state['last_update'] != 0 and time_diff < 1.5 and percent_diff < 5.0 and current != total:
+                                return
+                            if upload_state['last_update'] != 0 and time_diff < 0.8 and current != total:
                                 return
 
                             elapsed = now - upload_state['start_time']
                             speed = current / elapsed if elapsed > 0 else 0
                             remaining_bytes = max(0, total - current)
                             eta = remaining_bytes / speed if speed > 0 else 0
-                            percent = (current / total * 100) if total > 0 else 0.0
                             bar = make_progress_bar(percent)
 
                             speed_str = f"{format_size(speed)}/s" if speed else "Calculating..."
@@ -303,19 +326,24 @@ def download_video(client, message):
                             )
 
                             try:
-                                status_msg.edit_text(text)
+                                app.edit_message_text(chat_id, status_msg.id, text)
                                 upload_state['last_update'] = now
+                                upload_state['last_percent'] = percent
                             except FloodWait as fw:
                                 time.sleep(fw.value)
                             except MessageNotModified:
                                 pass
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                print(f"Upload progress edit error: {e}")
 
                         try:
-                            status_msg.edit_text("📤 Starting upload to Telegram...", reply_markup=ReplyKeyboardRemove())
-                        except Exception:
-                            pass
+                            app.edit_message_text(
+                                chat_id,
+                                status_msg.id,
+                                "📤 **Starting upload to Telegram...**\n`[□□□□□□□□□□]` **0.0%**"
+                            )
+                        except Exception as e:
+                            print(f"Initial upload edit error: {e}")
 
                         try:
                             message.reply_video(
@@ -324,14 +352,20 @@ def download_video(client, message):
                                 progress=upload_progress_hook,
                                 reply_markup=ReplyKeyboardRemove()
                             )
-                            # Remove status message on successful send
+                            # Update status to completed, then clean up after a short delay
                             try:
-                                status_msg.delete()
-                            except Exception:
-                                pass
+                                app.edit_message_text(chat_id, status_msg.id, "✅ **Upload complete!**")
+                                time.sleep(2)
+                                app.delete_messages(chat_id, status_msg.id)
+                            except Exception as e:
+                                print(f"Status cleanup error: {e}")
                         except Exception as upload_error:
                             try:
-                                status_msg.edit_text(f"❌ Error uploading the video: {upload_error}", reply_markup=ReplyKeyboardRemove())
+                                app.edit_message_text(
+                                    chat_id,
+                                    status_msg.id,
+                                    f"❌ Error uploading the video: {upload_error}"
+                                )
                             except Exception:
                                 message.reply_text(f"Error uploading the video: {upload_error}", reply_markup=ReplyKeyboardRemove())
 
@@ -339,7 +373,7 @@ def download_video(client, message):
                         break
                 else:
                     try:
-                        status_msg.edit_text("❌ Downloaded file not found.", reply_markup=ReplyKeyboardRemove())
+                        app.edit_message_text(chat_id, status_msg.id, "❌ Downloaded file not found.")
                     except Exception:
                         message.reply_text("Downloaded file not found.", reply_markup=ReplyKeyboardRemove())
 
@@ -348,7 +382,11 @@ def download_video(client, message):
                     pass
                 else:
                     try:
-                        status_msg.edit_text(f"❌ Error downloading the video: {e}. Please choose another resolution or try again later.", reply_markup=ReplyKeyboardRemove())
+                        app.edit_message_text(
+                            chat_id,
+                            status_msg.id,
+                            f"❌ Error downloading the video: {e}. Please choose another resolution or try again later."
+                        )
                     except Exception:
                         message.reply_text(f"Error downloading the video: {e}. Please choose another resolution or try again later.", reply_markup=ReplyKeyboardRemove())
 
