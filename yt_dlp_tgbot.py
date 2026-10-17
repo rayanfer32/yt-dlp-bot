@@ -7,7 +7,7 @@ import uuid
 import shutil
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
-
+import yt_dlp
 from pyrogram import Client, filters, idle
 from pyrogram.types import (
     InlineKeyboardMarkup,
