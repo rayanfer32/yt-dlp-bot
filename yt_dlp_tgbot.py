@@ -43,10 +43,10 @@ links_store = {}
 # task_id -> {"cancelled": bool, "title": str, "chat_id": int, "folder": str}
 active_tasks = {}
 
-def is_user_allowed(chat_id):
+def is_user_allowed(user_id):
     if not allowed_ids:
         return True
-    return chat_id in allowed_ids
+    return user_id in allowed_ids
 
 def format_size(bytes_val):
     if not bytes_val or bytes_val <= 0:
@@ -79,12 +79,73 @@ def make_progress_bar(percent, length=10):
 def start(client, message):
     message.reply_text("👋 Send me any video link or direct download URL to get started!", quote=True)
 
+# Handler for editing video caption by replying to the video message
+@app.on_message(filters.command("caption"))
+def edit_caption(client, message):
+    user_id = message.from_user.id if message.from_user else message.chat.id
+
+    if not is_user_allowed(user_id):
+        return
+
+    reply = message.reply_to_message
+    if not reply:
+        info_msg = message.reply_text("⚠️ Please reply to a video message with `/caption <new caption>`.", quote=True)
+        time.sleep(3)
+        try:
+            info_msg.delete()
+            message.delete()
+        except Exception:
+            pass
+        return
+
+    if not (reply.video or reply.document or reply.audio or reply.animation or reply.photo):
+        info_msg = message.reply_text("⚠️ The replied message does not contain a video or media file.", quote=True)
+        time.sleep(3)
+        try:
+            info_msg.delete()
+            message.delete()
+        except Exception:
+            pass
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        info_msg = message.reply_text("⚠️ Please provide the new caption. Usage: `/caption <new caption>`", quote=True)
+        time.sleep(3)
+        try:
+            info_msg.delete()
+            message.delete()
+        except Exception:
+            pass
+        return
+
+    new_caption = parts[1].strip()
+
+    try:
+        reply.edit_caption(new_caption)
+        confirm_msg = message.reply_text("✅ Caption updated!", quote=True)
+        time.sleep(3)
+        try:
+            confirm_msg.delete()
+            message.delete()
+        except Exception:
+            pass
+    except Exception as e:
+        err_msg = message.reply_text(f"❌ Failed to update caption: {e}", quote=True)
+        time.sleep(4)
+        try:
+            err_msg.delete()
+            message.delete()
+        except Exception:
+            pass
+
 # Handler for receiving a message with a link
 @app.on_message(filters.regex(r'https?://[^\s]+'))
 def handle_link(client, message):
     chat_id = message.chat.id
+    user_id = message.from_user.id if message.from_user else chat_id
 
-    if not is_user_allowed(chat_id):
+    if not is_user_allowed(user_id):
         return
 
     link = message.text.strip()
@@ -157,8 +218,9 @@ def handle_link(client, message):
 def handle_callback(client, callback_query):
     data = callback_query.data
     chat_id = callback_query.message.chat.id
+    user_id = callback_query.from_user.id if callback_query.from_user else chat_id
 
-    if not is_user_allowed(chat_id):
+    if not is_user_allowed(user_id):
         callback_query.answer("You are not authorized to use this bot.", show_alert=True)
         return
 

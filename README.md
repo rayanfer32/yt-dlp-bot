@@ -113,8 +113,9 @@ uv run python yt_dlp_tgbot.py
 2. Paste any supported video link or direct media URL.
 3. Choose your preferred resolution / format from the reply keyboard.
 4. Watch real-time download and upload progress indicators.
-5. Tap **Cancel Download** at any time if you wish to stop the download.
+5. Tap **Cancel Download** on any download progress message to cancel that specific task.
 6. The bot uploads the video directly into the chat with the original video title as caption, then cleans up temporary files.
+7. **Edit Caption**: Reply to any sent video with `/caption <new caption>` to instantly update its caption. The bot updates the caption and auto-deletes the command and confirmation after 3 seconds to keep your chat clean.
 
 ---
 
