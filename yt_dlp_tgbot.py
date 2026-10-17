@@ -1,5 +1,5 @@
 #v1.0
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from pyrogram.errors import FloodWait, MessageNotModified
 import yt_dlp
@@ -350,7 +350,20 @@ def download_video(client, message):
         message.reply_text("No link found. Please send a link first.")
         user_states.pop(chat_id, None)  # Remove the state lock in case no link was found
 
+def run_bot():
+    app.start()
+    me = app.get_me()
+    print(f"Bot started as @{me.username or me.id}")
+    for uid in allowed_ids:
+        try:
+            app.send_message(uid, "🟢 Bot started successfully")
+        except Exception as e:
+            print(f"Could not send startup message to {uid}: {e}")
+    idle()
+    app.stop()
+
 # Run the bot
 if __name__ == "__main__":
-    app.run()
+    run_bot()
+
 

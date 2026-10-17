@@ -1,8 +1,8 @@
-from yt_dlp_tgbot import app
+from yt_dlp_tgbot import run_bot
 
 
 def main():
-    app.run()
+    run_bot()
 
 
 if __name__ == "__main__":
