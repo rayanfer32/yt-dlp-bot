@@ -103,6 +103,7 @@ uv run python yt_dlp_tgbot.py
 | `BOT_TOKEN` | **Yes** | Telegram Bot Token from [@BotFather](https://t.me/BotFather). |
 | `APP_TITLE` | No | Pyrogram session file name (default: `yt_dlp_bot`). |
 | `ALLOWED_IDS`| No | Comma-separated list of Telegram user IDs permitted to use the bot. |
+| `MAX_CONCURRENT_DOWNLOADS` | No | Number of downloads permitted to run in parallel (default: `5`). |
 
 ---
 

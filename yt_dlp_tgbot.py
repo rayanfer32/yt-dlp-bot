@@ -1,13 +1,20 @@
 #v1.0
-from pyrogram import Client, filters, idle
-from pyrogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
-from pyrogram.errors import FloodWait, MessageNotModified
-import yt_dlp
 import os
 import subprocess
 import re
 import time
+import uuid
+import shutil
+from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
+
+from pyrogram import Client, filters, idle
+from pyrogram.types import (
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ReplyKeyboardRemove
+)
+from pyrogram.errors import FloodWait, MessageNotModified
 
 # Load environment variables from .env file
 load_dotenv()
@@ -18,6 +25,7 @@ if API_ID and API_ID.isdigit():
 API_HASH = os.getenv("API_HASH") or None
 BOT_TOKEN = os.getenv("BOT_TOKEN") or None
 APP_TITLE = os.getenv("APP_TITLE") or "yt_dlp_bot"
+MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "5"))
 
 # Allowed user IDs from environment (comma-separated, e.g. ALLOWED_IDS=123456,789012)
 allowed_ids_raw = os.getenv("ALLOWED_IDS", "")
@@ -26,9 +34,14 @@ allowed_ids = [int(x.strip()) for x in allowed_ids_raw.split(",") if x.strip().i
 # Create a Client instance with your API ID and API hash
 app = Client(APP_TITLE, api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# Global dictionary to store video format details
-links_data = {}
-user_states = {}
+# Thread pool executor for concurrent downloads
+executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_DOWNLOADS)
+
+# link_id -> {"link": str, "title": str, "formats": [(btn_text, format_id), ...]}
+links_store = {}
+
+# task_id -> {"cancelled": bool, "title": str, "chat_id": int, "folder": str}
+active_tasks = {}
 
 def is_user_allowed(chat_id):
     if not allowed_ids:
@@ -60,11 +73,11 @@ def make_progress_bar(percent, length=10):
     filled = int(round(length * percent / 100))
     bar = "■" * filled + "□" * (length - filled)
     return bar
-    
+
 # Define the /start command handler
 @app.on_message(filters.command("start"))
 def start(client, message):
-    message.reply_text("Please send a link")
+    message.reply_text("👋 Send me any video link or direct download URL to get started!", quote=True)
 
 # Handler for receiving a message with a link
 @app.on_message(filters.regex(r'https?://[^\s]+'))
@@ -74,36 +87,25 @@ def handle_link(client, message):
     if not is_user_allowed(chat_id):
         return
 
-    # Check if the user is already in a downloading state
-    if user_states.get(chat_id, None) == 'downloading':
-        message.reply_text("Please wait, your previous request is still being processed.")
-        return
+    link = message.text.strip()
+    wait_msg = message.reply_text("🔍 Fetching video info...", quote=True)
 
-    user_folder = f'downloads/{chat_id}'
-
-    # Check if the folder exists, if not, create it
-    if not os.path.exists(user_folder):
-        os.makedirs(user_folder)
-
-    link = message.text
-    # Get video formats using yt-dlp
     ydl_opts = {
-        'quiet': True
+        'quiet': True,
+        'no_warnings': True
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info_dict = ydl.extract_info(link, download=False)
             formats = info_dict.get('formats') or [info_dict]
-            title = info_dict.get('title', 'Video')
+            title = info_dict.get('title') or 'Video'
     except Exception as e:
-        # Error handling when link is not supported or other exceptions occur
-        message.reply_text(f"Error fetching link info. The link may not be supported.")
+        wait_msg.edit_text(f"❌ Error fetching link info: {e}")
         return
 
-    # Extracting rows with resolutions
-    button_rows = []
-    current_row = []
-    format_ids = {}
+    # Extracting available formats
+    format_items = []
+    seen_texts = set()
     for f in formats:
         format_id = f.get('format_id') or 'best'
         # Skip storyboard and manifest-only formats
@@ -115,291 +117,301 @@ def handle_link(client, message):
             ext = f.get('ext') or 'media'
             resolution = f"Direct ({ext.upper()})"
 
-        protocol = f.get('protocol', 'Unknown Proto')  # Extract the protocol
-        button_text = f"{resolution} ({protocol})"  # Include protocol in the button text
-        if button_text not in format_ids:  # Avoid duplicate buttons
-            format_ids[button_text] = format_id
-            current_row.append(KeyboardButton(button_text))
-            # Grouping buttons, 2 per row for better layout
-            if len(current_row) == 2:
-                button_rows.append(current_row)
-                current_row = []
+        protocol = f.get('protocol', 'Unknown Proto')
+        button_text = f"{resolution} ({protocol})"
+        if button_text not in seen_texts:
+            seen_texts.add(button_text)
+            format_items.append((button_text, format_id))
 
-    # Add any remaining buttons to the last row
+    if not format_items:
+        format_items.append(("Best / Default", "best"))
+
+    # Save to links_store with unique link_id
+    link_id = uuid.uuid4().hex[:8]
+    links_store[link_id] = {
+        "link": link,
+        "title": title,
+        "formats": format_items
+    }
+
+    # Build inline keyboard buttons (2 per row)
+    inline_keyboard = []
+    current_row = []
+    for idx, (btn_text, _) in enumerate(format_items):
+        current_row.append(InlineKeyboardButton(btn_text, callback_data=f"dl:{link_id}:{idx}"))
+        if len(current_row) == 2:
+            inline_keyboard.append(current_row)
+            current_row = []
     if current_row:
-        button_rows.append(current_row)
+        inline_keyboard.append(current_row)
 
-    # Fallback if no format buttons were created
-    if not format_ids:
-        button_text = "Best / Default"
-        format_ids[button_text] = "best"
-        button_rows.append([KeyboardButton(button_text)])
+    inline_keyboard.append([InlineKeyboardButton("❌ Dismiss", callback_data=f"dismiss:{link_id}")])
 
-    # Storing link and format IDs
-    links_data[message.chat.id] = (link, format_ids, title)
+    wait_msg.edit_text(
+        f"🎬 **{title}**\n\nChoose resolution / quality to download:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard)
+    )
 
-    # Sending a message with buttons if any were found
-    if button_rows:
-        reply_markup = ReplyKeyboardMarkup(button_rows, resize_keyboard=True, one_time_keyboard=True)
-        message.reply_text("Choose a resolution and protocol:", reply_markup=reply_markup)
-    else:
-        message.reply_text("No downloadable links found.")
-
-@app.on_message(filters.regex("Cancel Download"))
-def cancel_download(client, message):
-    chat_id = message.chat.id
-
-    # Check if the user is in a downloading state
-    if user_states.get(chat_id) == 'downloading':
-        user_states[chat_id] = 'cancel'
-        message.reply_text("Cancelling download...", reply_markup=ReplyKeyboardRemove())
-    else:
-        message.reply_text("No active download to cancel.", reply_markup=ReplyKeyboardRemove())
-
-def check_cancel(data, chat_id, message, status_msg=None):
-    """Check if the download should be cancelled."""
-    if user_states.get(chat_id) == 'cancel':
-        if status_msg:
-            try:
-                app.edit_message_text(chat_id, status_msg.id, "🚫 Download cancelled by user.")
-            except Exception as e:
-                print(f"Cancel status edit error: {e}")
-        else:
-            message.reply_text("Download cancelled by user.", reply_markup=ReplyKeyboardRemove())
-        raise Exception("Download cancelled by user")
-
-# Handler for processing the user's choice
-@app.on_message(filters.text)
-def download_video(client, message):
-    chat_id = message.chat.id
+# Callback query handler for interactive buttons
+@app.on_callback_query()
+def handle_callback(client, callback_query):
+    data = callback_query.data
+    chat_id = callback_query.message.chat.id
 
     if not is_user_allowed(chat_id):
-        return
-    
-    if user_states.get(chat_id, None) == 'downloading':
-        message.reply_text("Please wait, your previous request is still being processed.")
-        return
-        
-    # Check if the user is already in a downloading state
-    if user_states.get(chat_id) == 'cancel':
-        message.reply_text("Download cancelled by user.", reply_markup=ReplyKeyboardRemove())
-        user_states.pop(chat_id, None)
+        callback_query.answer("You are not authorized to use this bot.", show_alert=True)
         return
 
-    user_folder = f'downloads/{chat_id}'
-    if chat_id in links_data:
-        link, format_ids, title = links_data[chat_id]
-        chosen_resolution = message.text
+    if data.startswith("dismiss:"):
+        callback_query.message.delete()
+        callback_query.answer("Dismissed.")
+        return
 
-        if chosen_resolution in format_ids:
-            format_id = format_ids[chosen_resolution]
-
-            # Set the user state to 'downloading'
-            user_states[chat_id] = 'downloading'
-
-            # Notify the user that the download has started
-            cancel_button = KeyboardButton("Cancel Download")
-            reply_markup = ReplyKeyboardMarkup([[cancel_button]], resize_keyboard=True, one_time_keyboard=True)
-            status_msg = message.reply_text("⏳ Initializing download... Press 'Cancel Download' to stop.", reply_markup=reply_markup)
-
-            progress_state = {
-                'last_update': 0,
-                'last_percent': -1,
-                'start_time': time.time()
-            }
-
-            def ydl_progress_hook(d):
-                check_cancel(d, chat_id, message, status_msg)
-                if d.get('status') == 'downloading':
-                    total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
-                    downloaded = d.get('downloaded_bytes', 0)
-                    percent = (downloaded / total * 100) if total > 0 else 0.0
-
-                    now = time.time()
-                    time_diff = now - progress_state['last_update']
-                    percent_diff = abs(percent - progress_state['last_percent'])
-
-                    # Update if at least 1.5s has passed, or if progress changed by >= 5% (min 0.8s between edits)
-                    if progress_state['last_update'] != 0 and time_diff < 1.5 and percent_diff < 5.0 and downloaded != total:
-                        return
-                    if progress_state['last_update'] != 0 and time_diff < 0.8:
-                        return
-
-                    speed = d.get('speed') or 0
-                    eta = d.get('eta')
-                    bar = make_progress_bar(percent)
-
-                    total_str = format_size(total) if total > 0 else "Unknown"
-                    speed_str = f"{format_size(speed)}/s" if speed else "Calculating..."
-                    eta_str = format_time(eta) if eta else "--:--"
-
-                    text = (
-                        f"📥 **Downloading Video:**\n"
-                        f"`[{bar}]` **{percent:.1f}%**\n\n"
-                        f"📦 **Size:** `{format_size(downloaded)}` / `{total_str}`\n"
-                        f"⚡ **Speed:** `{speed_str}`\n"
-                        f"⏱️ **ETA:** `{eta_str}`"
-                    )
-
-                    try:
-                        app.edit_message_text(chat_id, status_msg.id, text)
-                        progress_state['last_update'] = now
-                        progress_state['last_percent'] = percent
-                    except FloodWait as fw:
-                        time.sleep(fw.value)
-                    except MessageNotModified:
-                        pass
-                    except Exception as e:
-                        print(f"Download progress edit error: {e}")
-
-                elif d.get('status') == 'finished':
-                    try:
-                        app.edit_message_text(
-                            chat_id,
-                            status_msg.id,
-                            "⚙️ **Download finished, processing video file...**"
-                        )
-                    except Exception as e:
-                        print(f"Finished edit error: {e}")
-
-            # Attempt to download the video using yt-dlp
+    if data.startswith("cancel:"):
+        _, task_id = data.split(":", 1)
+        task = active_tasks.get(task_id)
+        if task:
+            task["cancelled"] = True
+            callback_query.answer("Download cancelled.")
             try:
-                ydl_opts = {
-                    'format': format_id,
-                    'outtmpl': f'{user_folder}/{chat_id}_%(title)s.%(ext)s',
-                    'progress_hooks': [ydl_progress_hook]
-                }
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([link])
-
-                # Find the downloaded file and check its size
-                for file in os.listdir(user_folder):
-                    if file.startswith(str(chat_id)):
-                        full_path = os.path.join(user_folder, file)
-                        file_size = os.path.getsize(full_path)
-
-                        # Check if the file size is greater than 2GB
-                        if file_size > 2 * 1024 * 1024 * 1024:  # 2GB in bytes
-                            try:
-                                app.edit_message_text(
-                                    chat_id,
-                                    status_msg.id,
-                                    "❌ Error: The downloaded video is too large to be sent via Telegram (> 2GB)."
-                                )
-                            except Exception:
-                                message.reply_text("Error: The downloaded video is too large to be sent via Telegram.", reply_markup=ReplyKeyboardRemove())
-                            os.remove(full_path)  # Remove the large file
-                            break
-
-                        upload_state = {
-                            'last_update': 0,
-                            'last_percent': -1,
-                            'start_time': time.time()
-                        }
-
-                        def upload_progress_hook(current, total):
-                            percent = (current / total * 100) if total > 0 else 0.0
-                            now = time.time()
-                            time_diff = now - upload_state['last_update']
-                            percent_diff = abs(percent - upload_state['last_percent'])
-
-                            if upload_state['last_update'] != 0 and time_diff < 1.5 and percent_diff < 5.0 and current != total:
-                                return
-                            if upload_state['last_update'] != 0 and time_diff < 0.8 and current != total:
-                                return
-
-                            elapsed = now - upload_state['start_time']
-                            speed = current / elapsed if elapsed > 0 else 0
-                            remaining_bytes = max(0, total - current)
-                            eta = remaining_bytes / speed if speed > 0 else 0
-                            bar = make_progress_bar(percent)
-
-                            speed_str = f"{format_size(speed)}/s" if speed else "Calculating..."
-                            eta_str = format_time(eta) if eta else "--:--"
-
-                            text = (
-                                f"📤 **Uploading to Telegram:**\n"
-                                f"`[{bar}]` **{percent:.1f}%**\n\n"
-                                f"📦 **Size:** `{format_size(current)}` / `{format_size(total)}`\n"
-                                f"⚡ **Speed:** `{speed_str}`\n"
-                                f"⏱️ **ETA:** `{eta_str}`"
-                            )
-
-                            try:
-                                app.edit_message_text(chat_id, status_msg.id, text)
-                                upload_state['last_update'] = now
-                                upload_state['last_percent'] = percent
-                            except FloodWait as fw:
-                                time.sleep(fw.value)
-                            except MessageNotModified:
-                                pass
-                            except Exception as e:
-                                print(f"Upload progress edit error: {e}")
-
-                        try:
-                            app.edit_message_text(
-                                chat_id,
-                                status_msg.id,
-                                "📤 **Starting upload to Telegram...**\n`[□□□□□□□□□□]` **0.0%**"
-                            )
-                        except Exception as e:
-                            print(f"Initial upload edit error: {e}")
-
-                        try:
-                            message.reply_video(
-                                full_path,
-                                caption=title,
-                                progress=upload_progress_hook,
-                                reply_markup=ReplyKeyboardRemove()
-                            )
-                            # Update status to completed, then clean up after a short delay
-                            try:
-                                app.edit_message_text(chat_id, status_msg.id, "✅ **Upload complete!**")
-                                time.sleep(2)
-                                app.delete_messages(chat_id, status_msg.id)
-                            except Exception as e:
-                                print(f"Status cleanup error: {e}")
-                        except Exception as upload_error:
-                            try:
-                                app.edit_message_text(
-                                    chat_id,
-                                    status_msg.id,
-                                    f"❌ Error uploading the video: {upload_error}"
-                                )
-                            except Exception:
-                                message.reply_text(f"Error uploading the video: {upload_error}", reply_markup=ReplyKeyboardRemove())
-
-                        os.remove(full_path)  # Remove the file after sending
-                        break
-                else:
-                    try:
-                        app.edit_message_text(chat_id, status_msg.id, "❌ Downloaded file not found.")
-                    except Exception:
-                        message.reply_text("Downloaded file not found.", reply_markup=ReplyKeyboardRemove())
-
+                callback_query.message.edit_text(f"🚫 **Download cancelled by user.**\n`{task.get('title', 'Video')}`")
             except Exception as e:
-                if "Download cancelled by user" in str(e):
-                    pass
-                else:
-                    try:
-                        app.edit_message_text(
-                            chat_id,
-                            status_msg.id,
-                            f"❌ Error downloading the video: {e}. Please choose another resolution or try again later."
-                        )
-                    except Exception:
-                        message.reply_text(f"Error downloading the video: {e}. Please choose another resolution or try again later.", reply_markup=ReplyKeyboardRemove())
-
-            finally:
-                # Remove the user state lock regardless of outcome
-                user_states.pop(chat_id, None)
-
+                print(f"Cancel edit error: {e}")
         else:
-            message.reply_text("Invalid resolution selected. Please choose another resolution or try again later.")
-            user_states.pop(chat_id, None)  # Remove the state lock in case of invalid selection
-    else:
-        message.reply_text("No link found. Please send a link first.")
-        user_states.pop(chat_id, None)  # Remove the state lock in case no link was found
+            callback_query.answer("Download not found or already finished.", show_alert=True)
+        return
+
+    if data.startswith("dl:"):
+        try:
+            _, link_id, idx_str = data.split(":", 2)
+            idx = int(idx_str)
+        except Exception:
+            callback_query.answer("Invalid request.", show_alert=True)
+            return
+
+        link_info = links_store.get(link_id)
+        if not link_info or idx >= len(link_info["formats"]):
+            callback_query.answer("⚠️ Session expired. Please send the link again.", show_alert=True)
+            return
+
+        btn_text, format_id = link_info["formats"][idx]
+        link = link_info["link"]
+        title = link_info["title"]
+
+        callback_query.answer(f"Starting {btn_text}...")
+
+        # Create unique task for this download
+        task_id = uuid.uuid4().hex[:8]
+        task_folder = f"downloads/{chat_id}/{task_id}"
+        os.makedirs(task_folder, exist_ok=True)
+
+        active_tasks[task_id] = {
+            "cancelled": False,
+            "title": title,
+            "chat_id": chat_id,
+            "folder": task_folder
+        }
+
+        cancel_markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel:{task_id}")
+        ]])
+
+        status_msg = callback_query.message.reply_text(
+            f"⏳ **Starting download:** {title[:40]}...\n`[□□□□□□□□□□]` **0.0%**",
+            reply_markup=cancel_markup,
+            quote=True
+        )
+
+        # Submit task to thread pool for concurrent execution
+        executor.submit(
+            run_download_task,
+            client,
+            chat_id,
+            task_id,
+            link,
+            format_id,
+            title,
+            task_folder,
+            status_msg
+        )
+
+def run_download_task(client, chat_id, task_id, link, format_id, title, task_folder, status_msg):
+    progress_state = {
+        'last_update': 0,
+        'last_percent': -1,
+        'start_time': time.time()
+    }
+
+    cancel_markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel:{task_id}")
+    ]])
+
+    def check_task_cancel():
+        if active_tasks.get(task_id, {}).get("cancelled"):
+            raise Exception("Download cancelled by user")
+
+    def ydl_progress_hook(d):
+        check_task_cancel()
+        if d.get('status') == 'downloading':
+            total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
+            downloaded = d.get('downloaded_bytes', 0)
+            percent = (downloaded / total * 100) if total > 0 else 0.0
+
+            now = time.time()
+            time_diff = now - progress_state['last_update']
+            percent_diff = abs(percent - progress_state['last_percent'])
+
+            # Throttle to ~1.2s or >= 5% change (with minimum 0.7s)
+            if progress_state['last_update'] != 0 and time_diff < 1.2 and percent_diff < 5.0 and downloaded != total:
+                return
+            if progress_state['last_update'] != 0 and time_diff < 0.7:
+                return
+
+            speed = d.get('speed') or 0
+            eta = d.get('eta')
+            bar = make_progress_bar(percent)
+
+            total_str = format_size(total) if total > 0 else "Unknown"
+            speed_str = f"{format_size(speed)}/s" if speed else "Calculating..."
+            eta_str = format_time(eta) if eta else "--:--"
+
+            text = (
+                f"📥 **Downloading:** {title[:35]}\n"
+                f"`[{bar}]` **{percent:.1f}%**\n\n"
+                f"📦 **Size:** `{format_size(downloaded)}` / `{total_str}`\n"
+                f"⚡ **Speed:** `{speed_str}`\n"
+                f"⏱️ **ETA:** `{eta_str}`"
+            )
+
+            try:
+                status_msg.edit_text(text, reply_markup=cancel_markup)
+                progress_state['last_update'] = now
+                progress_state['last_percent'] = percent
+            except FloodWait as fw:
+                time.sleep(fw.value)
+            except MessageNotModified:
+                pass
+            except Exception as e:
+                print(f"[{task_id}] Download progress edit error: {e}")
+
+        elif d.get('status') == 'finished':
+            try:
+                status_msg.edit_text(
+                    f"⚙️ **Processing video file:** {title[:35]}...\n`[■■■■■■■■■■]` **100%**",
+                    reply_markup=cancel_markup
+                )
+            except Exception as e:
+                print(f"[{task_id}] Finished edit error: {e}")
+
+    try:
+        ydl_opts = {
+            'format': format_id,
+            'outtmpl': f'{task_folder}/%(title)s.%(ext)s',
+            'progress_hooks': [ydl_progress_hook],
+            'quiet': True,
+            'no_warnings': True
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([link])
+
+        check_task_cancel()
+
+        # Find the downloaded file in the isolated task folder
+        files = [os.path.join(task_folder, f) for f in os.listdir(task_folder)]
+        if not files:
+            status_msg.edit_text("❌ Downloaded file not found.")
+            return
+
+        full_path = files[0]
+        file_size = os.path.getsize(full_path)
+
+        # Check if file size exceeds 2GB (standard Telegram limit)
+        if file_size > 2 * 1024 * 1024 * 1024:
+            status_msg.edit_text("❌ Error: The downloaded video is too large to send via Telegram (> 2GB).")
+            return
+
+        # Uploading phase
+        upload_state = {
+            'last_update': 0,
+            'last_percent': -1,
+            'start_time': time.time()
+        }
+
+        try:
+            status_msg.edit_text(
+                f"📤 **Uploading to Telegram:** {title[:35]}\n`[□□□□□□□□□□]` **0.0%**"
+            )
+        except Exception as e:
+            print(f"[{task_id}] Initial upload edit error: {e}")
+
+        def upload_progress_hook(current, total):
+            check_task_cancel()
+            percent = (current / total * 100) if total > 0 else 0.0
+            now = time.time()
+            time_diff = now - upload_state['last_update']
+            percent_diff = abs(percent - upload_state['last_percent'])
+
+            if upload_state['last_update'] != 0 and time_diff < 1.2 and percent_diff < 5.0 and current != total:
+                return
+            if upload_state['last_update'] != 0 and time_diff < 0.7 and current != total:
+                return
+
+            elapsed = now - upload_state['start_time']
+            speed = current / elapsed if elapsed > 0 else 0
+            remaining_bytes = max(0, total - current)
+            eta = remaining_bytes / speed if speed > 0 else 0
+            bar = make_progress_bar(percent)
+
+            speed_str = f"{format_size(speed)}/s" if speed else "Calculating..."
+            eta_str = format_time(eta) if eta else "--:--"
+
+            text = (
+                f"📤 **Uploading:** {title[:35]}\n"
+                f"`[{bar}]` **{percent:.1f}%**\n\n"
+                f"📦 **Size:** `{format_size(current)}` / `{format_size(total)}`\n"
+                f"⚡ **Speed:** `{speed_str}`\n"
+                f"⏱️ **ETA:** `{eta_str}`"
+            )
+
+            try:
+                status_msg.edit_text(text)
+                upload_state['last_update'] = now
+                upload_state['last_percent'] = percent
+            except FloodWait as fw:
+                time.sleep(fw.value)
+            except MessageNotModified:
+                pass
+            except Exception as e:
+                print(f"[{task_id}] Upload progress edit error: {e}")
+
+        # Send the video file
+        client.send_video(
+            chat_id=chat_id,
+            video=full_path,
+            caption=title,
+            progress=upload_progress_hook
+        )
+
+        try:
+            status_msg.edit_text(f"✅ **Completed:** {title[:40]}")
+            time.sleep(2)
+            status_msg.delete()
+        except Exception as e:
+            print(f"[{task_id}] Cleanup edit error: {e}")
+
+    except Exception as e:
+        if "Download cancelled by user" in str(e):
+            print(f"[{task_id}] Task cancelled cleanly.")
+        else:
+            print(f"[{task_id}] Download task error: {e}")
+            try:
+                status_msg.edit_text(f"❌ Error downloading video: {e}")
+            except Exception:
+                pass
+    finally:
+        # Clean up task directory and memory
+        shutil.rmtree(task_folder, ignore_errors=True)
+        active_tasks.pop(task_id, None)
 
 def run_bot():
     app.start()
@@ -416,5 +428,3 @@ def run_bot():
 # Run the bot
 if __name__ == "__main__":
     run_bot()
-
-
