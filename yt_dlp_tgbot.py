@@ -93,7 +93,7 @@ def handle_link(client, message):
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info_dict = ydl.extract_info(link, download=False)
-            formats = info_dict.get('formats', [info_dict])
+            formats = info_dict.get('formats') or [info_dict]
             title = info_dict.get('title', 'Video')
     except Exception as e:
         # Error handling when link is not supported or other exceptions occur
@@ -105,22 +105,35 @@ def handle_link(client, message):
     current_row = []
     format_ids = {}
     for f in formats:
-        format_id = f['format_id']
-        resolution = f.get('format_note', f.get('resolution'))
+        format_id = f.get('format_id') or 'best'
+        # Skip storyboard and manifest-only formats
+        if str(format_id).startswith('sb') or f.get('ext') == 'mhtml':
+            continue
+
+        resolution = f.get('format_note') or (f"{f['height']}p" if f.get('height') else None) or (f['resolution'] if f.get('resolution') and f['resolution'] != 'unknown' else None)
+        if not resolution or resolution == 'unknown':
+            ext = f.get('ext') or 'media'
+            resolution = f"Direct ({ext.upper()})"
+
         protocol = f.get('protocol', 'Unknown Proto')  # Extract the protocol
-        if resolution and resolution != 'unknown':
-            button_text = f"{resolution} ({protocol})"  # Include protocol in the button text
-            if button_text not in format_ids:  # Avoid duplicate buttons
-                format_ids[button_text] = format_id
-                current_row.append(KeyboardButton(button_text))
-                # Grouping buttons, 2 per row for better layout
-                if len(current_row) == 2:
-                    button_rows.append(current_row)
-                    current_row = []
+        button_text = f"{resolution} ({protocol})"  # Include protocol in the button text
+        if button_text not in format_ids:  # Avoid duplicate buttons
+            format_ids[button_text] = format_id
+            current_row.append(KeyboardButton(button_text))
+            # Grouping buttons, 2 per row for better layout
+            if len(current_row) == 2:
+                button_rows.append(current_row)
+                current_row = []
 
     # Add any remaining buttons to the last row
     if current_row:
         button_rows.append(current_row)
+
+    # Fallback if no format buttons were created
+    if not format_ids:
+        button_text = "Best / Default"
+        format_ids[button_text] = "best"
+        button_rows.append([KeyboardButton(button_text)])
 
     # Storing link and format IDs
     links_data[message.chat.id] = (link, format_ids, title)
