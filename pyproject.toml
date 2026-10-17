@@ -8,6 +8,6 @@ dependencies = [
     "pyrogram>=2.0.106",
     "python-dotenv>=1.2.4",
     "tgcrypto>=1.2.5",
-    "yt-dlp>=2026.8.19",
+    "yt-dlp[curl-cffi,default]>=2026.8.19",
 ]
 
