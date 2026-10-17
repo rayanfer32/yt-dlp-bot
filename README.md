@@ -16,11 +16,24 @@ Filll "App title" and "Short name" and click on "Create application"
 ### Step 4:
 Use @BotFather on telegram to create and get BOT TOKEN
 ### Step 5:
-Open `yt_dlp_tgbot.py` with your text editor and replace `App_Title` and `API_ID` and `API_HASH` and `BOT_TOKEN` with your own information
-## Install required packages:
-`$ sudo apt update && apt install python3-pip tmux -y && pip install yt-dlp pyrogram TgCrypto`
+Copy `.env.example` to `.env` and fill in your credentials:
+```env
+API_ID=your_api_id
+API_HASH=your_api_hash
+BOT_TOKEN=your_bot_token
+```
+
+## Install dependencies and manage project:
+Using [uv](https://docs.astral.sh/uv/):
+```bash
+# Install dependencies
+uv sync
+```
+
 ### Start the bot:
-`$ python3 yt_dlp_tgbot.py`
+```bash
+uv run python yt_dlp_tgbot.py
+```
 
 ## Important Tips
 

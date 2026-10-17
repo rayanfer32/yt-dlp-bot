@@ -5,15 +5,32 @@ import yt_dlp
 import os
 import subprocess
 import re
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
+API_ID = os.getenv("API_ID") or None
+if API_ID and API_ID.isdigit():
+    API_ID = int(API_ID)
+API_HASH = os.getenv("API_HASH") or None
+BOT_TOKEN = os.getenv("BOT_TOKEN") or None
+APP_TITLE = os.getenv("APP_TITLE") or "yt_dlp_bot"
+
+# Allowed user IDs from environment (comma-separated, e.g. ALLOWED_IDS=123456,789012)
+allowed_ids_raw = os.getenv("ALLOWED_IDS", "")
+allowed_ids = [int(x.strip()) for x in allowed_ids_raw.split(",") if x.strip().isdigit()]
+
 # Create a Client instance with your API ID and API hash
-#allowed_ids = [ID]
-app = Client("App_Title", api_id="API_ID", api_hash="API_HASH", bot_token="BOT_TOKEN")
+app = Client(APP_TITLE, api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # Global dictionary to store video format details
 links_data = {}
 user_states = {}
 
 def is_user_allowed(chat_id):
+    if not allowed_ids:
+        return True
     return chat_id in allowed_ids
     
 # Define the /start command handler
@@ -187,4 +204,6 @@ def check_cancel(data, chat_id, message):
         message.reply_text("Download cancelled by user.")
         raise Exception("Download cancelled by user")
 # Run the bot
-app.run()
+if __name__ == "__main__":
+    app.run()
+
