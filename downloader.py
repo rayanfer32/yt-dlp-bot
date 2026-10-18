@@ -108,10 +108,14 @@ class PipelinedFile(io.IOBase):
                 break
 
             if self.download_state.get("finished"):
-                logger.debug(
-                    f"[{self.task_id}] Download finished while waiting for bytes. "
-                    f"Disk size={curr_size}, needed target={target_pos}, total={self.total_size}"
-                )
+                if curr_size < self.total_size:
+                    logger.warning(
+                        f"[{self.task_id}] Download finished with disk size ({curr_size}) < total_size ({self.total_size}). "
+                        f"Adjusting total_size to {curr_size}."
+                    )
+                    self.total_size = curr_size
+                    target_pos = min(self._pos + size, self.total_size)
+                    needed = max(0, target_pos - self._pos)
                 break
 
             now = time.time()
@@ -376,11 +380,37 @@ def run_download_task(client, chat_id, task_id, link, format_id, title, task_fol
         'last_ul_log_pct': -1
     }
 
-    def update_dual_progress(force=False):
+    edit_lock = threading.Lock()
+    is_editing = False
+
+    def async_edit_status(text, reply_markup=None, force=False):
+        nonlocal is_editing
         now = time.time()
-        if not force and (now - progress_tracking['last_update'] < 1.0):
+        if not force and (now - progress_tracking['last_update'] < 1.5):
             return
 
+        with edit_lock:
+            if is_editing and not force:
+                return
+            is_editing = True
+
+        progress_tracking['last_update'] = now
+
+        def _worker():
+            nonlocal is_editing
+            try:
+                status_msg.edit_text(text, reply_markup=reply_markup)
+            except (FloodWait, MessageNotModified):
+                pass
+            except Exception as edit_err:
+                logger.debug(f"[{task_id}] Progress edit notice: {edit_err}")
+            finally:
+                with edit_lock:
+                    is_editing = False
+
+        threading.Thread(target=_worker, daemon=True, name=f"Edit-{task_id}").start()
+
+    def update_dual_progress(force=False):
         dl_total = dl_state.get('total_bytes', 0)
         dl_curr = dl_state.get('downloaded_bytes', 0)
         dl_pct = (dl_curr / dl_total * 100) if dl_total > 0 else 0.0
@@ -392,6 +422,7 @@ def run_download_task(client, chat_id, task_id, link, format_id, title, task_fol
         dl_speed = dl_state.get('speed', 0)
         dl_speed_str = f"{format_size(dl_speed)}/s" if dl_speed else "Calculating..."
 
+        now = time.time()
         ul_elapsed = now - ul_state['start_time']
         ul_speed = ul_curr / ul_elapsed if ul_elapsed > 0 else 0
         ul_speed_str = f"{format_size(ul_speed)}/s" if ul_speed else "Calculating..."
@@ -408,14 +439,7 @@ def run_download_task(client, chat_id, task_id, link, format_id, title, task_fol
             f"   ⚡ `{ul_speed_str}` • `{format_size(ul_curr)}`\n\n"
             f"📦 **Size:** `{total_str}`"
         )
-
-        try:
-            status_msg.edit_text(text, reply_markup=cancel_markup)
-            progress_tracking['last_update'] = now
-        except (FloodWait, MessageNotModified):
-            pass
-        except Exception as edit_err:
-            logger.debug(f"[{task_id}] Stream progress edit notice: {edit_err}")
+        async_edit_status(text, reply_markup=cancel_markup, force=force)
 
     # Progress hook for yt-dlp
     def ydl_progress_hook(d):
@@ -451,12 +475,7 @@ def run_download_task(client, chat_id, task_id, link, format_id, title, task_fol
             if mode == "stream":
                 update_dual_progress()
             else:
-                now = time.time()
-                time_diff = now - progress_tracking['last_update']
                 percent = pct
-                if progress_tracking['last_update'] != 0 and time_diff < 1.0 and downloaded != total:
-                    return
-
                 bar = make_progress_bar(percent)
                 total_str = format_size(total) if total > 0 else "Unknown"
                 speed_str = f"{format_size(speed)}/s" if speed else "Calculating..."
@@ -469,13 +488,7 @@ def run_download_task(client, chat_id, task_id, link, format_id, title, task_fol
                     f"⚡ **Speed:** `{speed_str}`\n"
                     f"⏱️ **ETA:** `{eta_str}`"
                 )
-                try:
-                    status_msg.edit_text(text, reply_markup=cancel_markup)
-                    progress_tracking['last_update'] = now
-                except (FloodWait, MessageNotModified):
-                    pass
-                except Exception as edit_err:
-                    logger.debug(f"[{task_id}] Normal download edit notice: {edit_err}")
+                async_edit_status(text, reply_markup=cancel_markup)
 
         elif d.get('status') == 'finished':
             logger.info(f"[{task_id}] yt-dlp download status marked as 'finished'")
@@ -689,14 +702,7 @@ def run_download_task(client, chat_id, task_id, link, format_id, title, task_fol
                     f"⚡ **Speed:** `{speed_str}`\n"
                     f"⏱️ **ETA:** `{eta_str}`"
                 )
-                try:
-                    status_msg.edit_text(text, reply_markup=cancel_markup)
-                    upload_state['last_update'] = now
-                    upload_state['last_percent'] = percent
-                except (FloodWait, MessageNotModified):
-                    pass
-                except Exception as e:
-                    logger.debug(f"[{task_id}] Normal upload edit notice: {e}")
+                async_edit_status(text, reply_markup=cancel_markup)
 
             logger.info(f"[{task_id}] Uploading media to Telegram...")
             send_media(client, chat_id, full_path, title, progress=upload_progress_hook, task_id=task_id)

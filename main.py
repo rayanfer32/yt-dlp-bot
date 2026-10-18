@@ -3,8 +3,12 @@ from config import API_ID, API_HASH, BOT_TOKEN, APP_TITLE, allowed_ids
 from handlers import register_handlers
 
 from logger import setup_logger
+from patch import apply_patches
 
 logger = setup_logger("main")
+
+# Apply non-blocking Pyrogram save_file patch
+apply_patches()
 
 # Initialize Pyrogram client
 app = Client(APP_TITLE, api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)

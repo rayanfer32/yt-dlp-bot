@@ -86,9 +86,11 @@ def setup_logger(name: str = "yt_dlp_bot") -> logging.Logger:
         if hasattr(threading, "excepthook"):
             threading.excepthook = handle_thread_exception
 
-        # Tune Pyrogram logger
-        pyrogram_level = logging.INFO if level != logging.DEBUG else logging.DEBUG
-        logging.getLogger("pyrogram").setLevel(pyrogram_level)
+        # Suppress Pyrogram binary packet/session hex dumps and network noise
+        logging.getLogger("pyrogram").setLevel(logging.WARNING)
+        logging.getLogger("pyrogram.session").setLevel(logging.WARNING)
+        logging.getLogger("pyrogram.connection").setLevel(logging.WARNING)
+        logging.getLogger("urllib3").setLevel(logging.WARNING)
 
         _is_initialized = True
 
