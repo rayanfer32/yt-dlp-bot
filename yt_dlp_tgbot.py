@@ -43,6 +43,9 @@ links_store = {}
 # task_id -> {"cancelled": bool, "title": str, "chat_id": int, "folder": str}
 active_tasks = {}
 
+# retry_id -> {"link": str, "format_id": str, "title": str, "link_id": str}
+retry_downloads = {}
+
 def is_user_allowed(user_id):
     if not allowed_ids:
         return True
@@ -77,6 +80,9 @@ def make_progress_bar(percent, length=10):
 # Define the /start command handler
 @app.on_message(filters.command("start"))
 def start(client, message):
+    user_id = message.from_user.id if message.from_user else message.chat.id
+    if not is_user_allowed(user_id):
+        return message.reply_text("You are not allowed to use this bot.", quote=True)
     message.reply_text("👋 Send me any video link or direct download URL to get started!", quote=True)
 
 # Handler for editing video caption by replying to the video message
@@ -139,17 +145,18 @@ def edit_caption(client, message):
         except Exception:
             pass
 
-# Handler for receiving a message with a link
-@app.on_message(filters.regex(r'https?://[^\s]+'))
-def handle_link(client, message):
-    chat_id = message.chat.id
-    user_id = message.from_user.id if message.from_user else chat_id
+def process_link(client, chat_id, link, msg_to_edit, link_id=None):
+    if not link_id:
+        link_id = uuid.uuid4().hex[:8]
 
-    if not is_user_allowed(user_id):
-        return
-
-    link = message.text.strip()
-    wait_msg = message.reply_text("🔍 Fetching video info...", quote=True)
+    if link_id not in links_store:
+        links_store[link_id] = {
+            "link": link,
+            "title": "",
+            "formats": []
+        }
+    else:
+        links_store[link_id]["link"] = link
 
     ydl_opts = {
         'quiet': True,
@@ -161,7 +168,20 @@ def handle_link(client, message):
             formats = info_dict.get('formats') or [info_dict]
             title = info_dict.get('title') or 'Video'
     except Exception as e:
-        wait_msg.edit_text(f"❌ Error fetching link info: {e}")
+        err_str = str(e)
+        if len(err_str) > 3000:
+            err_str = err_str[:3000] + "... (truncated)"
+        retry_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Retry", callback_data=f"retry_link:{link_id}")],
+            [InlineKeyboardButton("❌ Dismiss", callback_data=f"dismiss:{link_id}")]
+        ])
+        try:
+            msg_to_edit.edit_text(
+                f"❌ **Error fetching link info:**\n`{err_str}`",
+                reply_markup=retry_markup
+            )
+        except Exception as edit_err:
+            print(f"Edit error on link fetch failure: {edit_err}")
         return
 
     # Extracting available formats
@@ -187,13 +207,8 @@ def handle_link(client, message):
     if not format_items:
         format_items.append(("Best / Default", "best"))
 
-    # Save to links_store with unique link_id
-    link_id = uuid.uuid4().hex[:8]
-    links_store[link_id] = {
-        "link": link,
-        "title": title,
-        "formats": format_items
-    }
+    links_store[link_id]["title"] = title
+    links_store[link_id]["formats"] = format_items
 
     # Build inline keyboard buttons (2 per row)
     inline_keyboard = []
@@ -208,10 +223,27 @@ def handle_link(client, message):
 
     inline_keyboard.append([InlineKeyboardButton("❌ Dismiss", callback_data=f"dismiss:{link_id}")])
 
-    wait_msg.edit_text(
-        f"🎬 **{title}**\n\nChoose resolution / quality to download:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard)
-    )
+    try:
+        msg_to_edit.edit_text(
+            f"🎬 **{title}**\n\nChoose resolution / quality to download:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard)
+        )
+    except Exception as edit_err:
+        print(f"Edit error on formats display: {edit_err}")
+
+# Handler for receiving a message with a link
+@app.on_message(filters.regex(r'https?://[^\s]+'))
+def handle_link(client, message):
+    chat_id = message.chat.id
+    user_id = message.from_user.id if message.from_user else chat_id
+
+    if not is_user_allowed(user_id):
+        return
+
+    link_match = re.search(r'https?://[^\s]+', message.text)
+    link = link_match.group(0) if link_match else message.text.strip()
+    wait_msg = message.reply_text("🔍 Fetching video info...", quote=True)
+    process_link(client, chat_id, link, wait_msg)
 
 # Callback query handler for interactive buttons
 @app.on_callback_query()
@@ -224,9 +256,80 @@ def handle_callback(client, callback_query):
         callback_query.answer("You are not authorized to use this bot.", show_alert=True)
         return
 
-    if data.startswith("dismiss:"):
-        callback_query.message.delete()
+    if data.startswith("dismiss"):
+        try:
+            callback_query.message.delete()
+        except Exception:
+            pass
         callback_query.answer("Dismissed.")
+        return
+
+    if data.startswith("retry_link:"):
+        _, link_id = data.split(":", 1)
+        link_info = links_store.get(link_id)
+        if not link_info or not link_info.get("link"):
+            callback_query.answer("⚠️ Session expired. Please send the link again.", show_alert=True)
+            return
+
+        callback_query.answer("🔄 Retrying...")
+        try:
+            callback_query.message.edit_text("🔍 Retrying: Fetching video info...")
+        except Exception:
+            pass
+
+        process_link(client, chat_id, link_info["link"], callback_query.message, link_id=link_id)
+        return
+
+    if data.startswith("retry_dl:"):
+        _, retry_id = data.split(":", 1)
+        retry_info = retry_downloads.get(retry_id)
+        if not retry_info:
+            callback_query.answer("⚠️ Session expired. Please send the link again.", show_alert=True)
+            return
+
+        link = retry_info["link"]
+        format_id = retry_info["format_id"]
+        title = retry_info["title"]
+        saved_link_id = retry_info.get("link_id")
+
+        callback_query.answer("🔄 Retrying download...")
+
+        # Create unique task for this download
+        task_id = uuid.uuid4().hex[:8]
+        task_folder = f"downloads/{chat_id}/{task_id}"
+        os.makedirs(task_folder, exist_ok=True)
+
+        active_tasks[task_id] = {
+            "cancelled": False,
+            "title": title,
+            "chat_id": chat_id,
+            "folder": task_folder
+        }
+
+        cancel_markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel:{task_id}")
+        ]])
+
+        try:
+            callback_query.message.edit_text(
+                f"⏳ **Starting download:** {title[:40]}...\n`[□□□□□□□□□□]` **0.0%**",
+                reply_markup=cancel_markup
+            )
+        except Exception:
+            pass
+
+        executor.submit(
+            run_download_task,
+            client,
+            chat_id,
+            task_id,
+            link,
+            format_id,
+            title,
+            task_folder,
+            callback_query.message,
+            saved_link_id
+        )
         return
 
     if data.startswith("cancel:"):
@@ -294,10 +397,11 @@ def handle_callback(client, callback_query):
             format_id,
             title,
             task_folder,
-            status_msg
+            status_msg,
+            link_id
         )
 
-def run_download_task(client, chat_id, task_id, link, format_id, title, task_folder, status_msg):
+def run_download_task(client, chat_id, task_id, link, format_id, title, task_folder, status_msg, link_id=None):
     progress_state = {
         'last_update': 0,
         'last_percent': -1,
@@ -467,9 +571,29 @@ def run_download_task(client, chat_id, task_id, link, format_id, title, task_fol
         else:
             print(f"[{task_id}] Download task error: {e}")
             try:
-                status_msg.edit_text(f"❌ Error downloading video: {e}")
-            except Exception:
-                pass
+                retry_id = uuid.uuid4().hex[:8]
+                retry_downloads[retry_id] = {
+                    "link": link,
+                    "format_id": format_id,
+                    "title": title,
+                    "link_id": link_id
+                }
+                buttons = [
+                    [InlineKeyboardButton("🔄 Retry", callback_data=f"retry_dl:{retry_id}")]
+                ]
+                if link_id and link_id in links_store:
+                    buttons.append([InlineKeyboardButton("🔗 Re-fetch Formats", callback_data=f"retry_link:{link_id}")])
+                buttons.append([InlineKeyboardButton("❌ Dismiss", callback_data=f"dismiss:{retry_id}")])
+
+                err_str = str(e)
+                if len(err_str) > 3000:
+                    err_str = err_str[:3000] + "... (truncated)"
+                status_msg.edit_text(
+                    f"❌ **Error downloading video:**\n`{err_str}`",
+                    reply_markup=InlineKeyboardMarkup(buttons)
+                )
+            except Exception as edit_err:
+                print(f"[{task_id}] Failed to edit error message: {edit_err}")
     finally:
         # Clean up task directory and memory
         shutil.rmtree(task_folder, ignore_errors=True)
