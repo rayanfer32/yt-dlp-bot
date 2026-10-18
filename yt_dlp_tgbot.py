@@ -46,10 +46,22 @@ active_tasks = {}
 # retry_id -> {"link": str, "format_id": str, "title": str, "link_id": str}
 retry_downloads = {}
 
+# user_id -> {"link_id": str, "retry_id": str, "prompt_msg_id": int, "chat_id": int, "message_id": int}
+pending_renames = {}
+
 def is_user_allowed(user_id):
     if not allowed_ids:
         return True
     return user_id in allowed_ids
+
+def clean_filename(name, max_len=120):
+    if not name:
+        return "Video"
+    cleaned = re.sub(r'[\/\\:*?"<>|\x00-\x1f]', '', str(name)).strip(" .")
+    cleaned = re.sub(r'\s+', ' ', cleaned)
+    if len(cleaned) > max_len:
+        cleaned = cleaned[:max_len].rstrip(" .")
+    return cleaned or "Video"
 
 def format_size(bytes_val):
     if not bytes_val or bytes_val <= 0:
@@ -145,6 +157,51 @@ def edit_caption(client, message):
         except Exception:
             pass
 
+def render_format_selector(link_id):
+    link_info = links_store.get(link_id)
+    if not link_info:
+        return None, None
+
+    title = link_info.get("title") or "Video"
+    format_items = link_info.get("formats", [])
+    is_long = len(title) > 60
+
+    text = f"🎬 **{title}**\n"
+    if is_long:
+        text += f"\n⚠️ **Notice:** Filename is long ({len(title)} chars). You can rename it before downloading.\n"
+    text += "\nChoose resolution / quality to download:"
+
+    inline_keyboard = []
+    current_row = []
+    for idx, (btn_text, _) in enumerate(format_items):
+        current_row.append(InlineKeyboardButton(btn_text, callback_data=f"dl:{link_id}:{idx}"))
+        if len(current_row) == 2:
+            inline_keyboard.append(current_row)
+            current_row = []
+    if current_row:
+        inline_keyboard.append(current_row)
+
+    rename_label = "✏️ Rename (Too Long)" if is_long else "✏️ Rename"
+    inline_keyboard.append([
+        InlineKeyboardButton(rename_label, callback_data=f"rename:{link_id}"),
+        InlineKeyboardButton("❌ Dismiss", callback_data=f"dismiss:{link_id}")
+    ])
+
+    return text, InlineKeyboardMarkup(inline_keyboard)
+
+def update_format_selector(client, chat_id, message_id, link_id):
+    text, markup = render_format_selector(link_id)
+    if text and markup:
+        try:
+            client.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                reply_markup=markup
+            )
+        except Exception as e:
+            print(f"Update format selector error: {e}")
+
 def process_link(client, chat_id, link, msg_to_edit, link_id=None):
     if not link_id:
         link_id = uuid.uuid4().hex[:8]
@@ -166,7 +223,8 @@ def process_link(client, chat_id, link, msg_to_edit, link_id=None):
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info_dict = ydl.extract_info(link, download=False)
             formats = info_dict.get('formats') or [info_dict]
-            title = info_dict.get('title') or 'Video'
+            raw_title = info_dict.get('title') or 'Video'
+            title = clean_filename(raw_title, max_len=200)
     except Exception as e:
         err_str = str(e)
         if len(err_str) > 3000:
@@ -210,24 +268,9 @@ def process_link(client, chat_id, link, msg_to_edit, link_id=None):
     links_store[link_id]["title"] = title
     links_store[link_id]["formats"] = format_items
 
-    # Build inline keyboard buttons (2 per row)
-    inline_keyboard = []
-    current_row = []
-    for idx, (btn_text, _) in enumerate(format_items):
-        current_row.append(InlineKeyboardButton(btn_text, callback_data=f"dl:{link_id}:{idx}"))
-        if len(current_row) == 2:
-            inline_keyboard.append(current_row)
-            current_row = []
-    if current_row:
-        inline_keyboard.append(current_row)
-
-    inline_keyboard.append([InlineKeyboardButton("❌ Dismiss", callback_data=f"dismiss:{link_id}")])
-
+    text, markup = render_format_selector(link_id)
     try:
-        msg_to_edit.edit_text(
-            f"🎬 **{title}**\n\nChoose resolution / quality to download:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard)
-        )
+        msg_to_edit.edit_text(text, reply_markup=markup)
     except Exception as edit_err:
         print(f"Edit error on formats display: {edit_err}")
 
@@ -240,10 +283,69 @@ def handle_link(client, message):
     if not is_user_allowed(user_id):
         return
 
+    # Clear any pending rename if user sends a new link
+    pending_renames.pop(user_id, None)
+
     link_match = re.search(r'https?://[^\s]+', message.text)
     link = link_match.group(0) if link_match else message.text.strip()
     wait_msg = message.reply_text("🔍 Fetching video info...", quote=True)
     process_link(client, chat_id, link, wait_msg)
+
+def start_download_from_retry(client, chat_id, retry_id, callback_message=None):
+    retry_info = retry_downloads.get(retry_id)
+    if not retry_info:
+        return
+
+    link = retry_info["link"]
+    format_id = retry_info["format_id"]
+    title = retry_info["title"]
+    saved_link_id = retry_info.get("link_id")
+
+    task_id = uuid.uuid4().hex[:8]
+    task_folder = f"downloads/{chat_id}/{task_id}"
+    os.makedirs(task_folder, exist_ok=True)
+
+    active_tasks[task_id] = {
+        "cancelled": False,
+        "title": title,
+        "chat_id": chat_id,
+        "folder": task_folder
+    }
+
+    cancel_markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel:{task_id}")
+    ]])
+
+    msg_for_task = None
+    if callback_message:
+        try:
+            callback_message.edit_text(
+                f"⏳ **Starting download:** {title[:40]}...\n`[□□□□□□□□□□]` **0.0%**",
+                reply_markup=cancel_markup
+            )
+            msg_for_task = callback_message
+        except Exception:
+            pass
+
+    if not msg_for_task:
+        msg_for_task = client.send_message(
+            chat_id,
+            f"⏳ **Starting download:** {title[:40]}...\n`[□□□□□□□□□□]` **0.0%**",
+            reply_markup=cancel_markup
+        )
+
+    executor.submit(
+        run_download_task,
+        client,
+        chat_id,
+        task_id,
+        link,
+        format_id,
+        title,
+        task_folder,
+        msg_for_task,
+        saved_link_id
+    )
 
 # Callback query handler for interactive buttons
 @app.on_callback_query()
@@ -280,6 +382,52 @@ def handle_callback(client, callback_query):
         process_link(client, chat_id, link_info["link"], callback_query.message, link_id=link_id)
         return
 
+    if data.startswith("rename:"):
+        _, link_id = data.split(":", 1)
+        link_info = links_store.get(link_id)
+        if not link_info:
+            callback_query.answer("⚠️ Session expired. Please send the link again.", show_alert=True)
+            return
+
+        callback_query.answer()
+        current_title = link_info.get("title", "Video")
+        prompt_msg = callback_query.message.reply_text(
+            f"✏️ **Rename Video Filename**\n\n"
+            f"Current filename ({len(current_title)} chars):\n`{current_title}`\n\n"
+            f"💬 Send your new filename below (or `/cancel` to abort):",
+            quote=True
+        )
+        pending_renames[user_id] = {
+            "link_id": link_id,
+            "prompt_msg_id": prompt_msg.id,
+            "chat_id": chat_id,
+            "message_id": callback_query.message.id
+        }
+        return
+
+    if data.startswith("rename_dl:"):
+        _, retry_id = data.split(":", 1)
+        retry_info = retry_downloads.get(retry_id)
+        if not retry_info:
+            callback_query.answer("⚠️ Session expired. Please send the link again.", show_alert=True)
+            return
+
+        callback_query.answer()
+        current_title = retry_info.get("title", "Video")
+        prompt_msg = callback_query.message.reply_text(
+            f"✏️ **Rename & Retry Download**\n\n"
+            f"Current filename ({len(current_title)} chars):\n`{current_title}`\n\n"
+            f"💬 Send your new filename below (or `/cancel` to abort):",
+            quote=True
+        )
+        pending_renames[user_id] = {
+            "retry_id": retry_id,
+            "prompt_msg_id": prompt_msg.id,
+            "chat_id": chat_id,
+            "message_id": callback_query.message.id
+        }
+        return
+
     if data.startswith("retry_dl:"):
         _, retry_id = data.split(":", 1)
         retry_info = retry_downloads.get(retry_id)
@@ -287,49 +435,8 @@ def handle_callback(client, callback_query):
             callback_query.answer("⚠️ Session expired. Please send the link again.", show_alert=True)
             return
 
-        link = retry_info["link"]
-        format_id = retry_info["format_id"]
-        title = retry_info["title"]
-        saved_link_id = retry_info.get("link_id")
-
         callback_query.answer("🔄 Retrying download...")
-
-        # Create unique task for this download
-        task_id = uuid.uuid4().hex[:8]
-        task_folder = f"downloads/{chat_id}/{task_id}"
-        os.makedirs(task_folder, exist_ok=True)
-
-        active_tasks[task_id] = {
-            "cancelled": False,
-            "title": title,
-            "chat_id": chat_id,
-            "folder": task_folder
-        }
-
-        cancel_markup = InlineKeyboardMarkup([[
-            InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel:{task_id}")
-        ]])
-
-        try:
-            callback_query.message.edit_text(
-                f"⏳ **Starting download:** {title[:40]}...\n`[□□□□□□□□□□]` **0.0%**",
-                reply_markup=cancel_markup
-            )
-        except Exception:
-            pass
-
-        executor.submit(
-            run_download_task,
-            client,
-            chat_id,
-            task_id,
-            link,
-            format_id,
-            title,
-            task_folder,
-            callback_query.message,
-            saved_link_id
-        )
+        start_download_from_retry(client, chat_id, retry_id, callback_query.message)
         return
 
     if data.startswith("cancel:"):
@@ -469,10 +576,11 @@ def run_download_task(client, chat_id, task_id, link, format_id, title, task_fol
             except Exception as e:
                 print(f"[{task_id}] Finished edit error: {e}")
 
+    safe_title = clean_filename(title, max_len=120)
     try:
         ydl_opts = {
             'format': format_id,
-            'outtmpl': f'{task_folder}/%(title)s.%(ext)s',
+            'outtmpl': f'{task_folder}/{safe_title}.%(ext)s',
             'progress_hooks': [ydl_progress_hook],
             'quiet': True,
             'no_warnings': True
@@ -579,7 +687,10 @@ def run_download_task(client, chat_id, task_id, link, format_id, title, task_fol
                     "link_id": link_id
                 }
                 buttons = [
-                    [InlineKeyboardButton("🔄 Retry", callback_data=f"retry_dl:{retry_id}")]
+                    [
+                        InlineKeyboardButton("🔄 Retry", callback_data=f"retry_dl:{retry_id}"),
+                        InlineKeyboardButton("✏️ Rename & Retry", callback_data=f"rename_dl:{retry_id}")
+                    ]
                 ]
                 if link_id and link_id in links_store:
                     buttons.append([InlineKeyboardButton("🔗 Re-fetch Formats", callback_data=f"retry_link:{link_id}")])
@@ -598,6 +709,105 @@ def run_download_task(client, chat_id, task_id, link, format_id, title, task_fol
         # Clean up task directory and memory
         shutil.rmtree(task_folder, ignore_errors=True)
         active_tasks.pop(task_id, None)
+
+# Command for renaming a pending link or replied video link message
+@app.on_message(filters.command("rename"))
+def rename_command(client, message):
+    user_id = message.from_user.id if message.from_user else message.chat.id
+    if not is_user_allowed(user_id):
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        message.reply_text(
+            "ℹ️ **How to rename:**\n"
+            "• Click the **✏️ Rename** button on any video message\n"
+            "• Or reply to a video message with `/rename <new filename>`",
+            quote=True
+        )
+        return
+
+    new_name = clean_filename(parts[1].strip(), max_len=120)
+
+    if user_id in pending_renames:
+        rename_info = pending_renames.pop(user_id)
+        link_id = rename_info.get("link_id")
+        retry_id = rename_info.get("retry_id")
+
+        if link_id and link_id in links_store:
+            links_store[link_id]["title"] = new_name
+            chat_id = rename_info.get("chat_id")
+            msg_id = rename_info.get("message_id")
+            if chat_id and msg_id:
+                update_format_selector(client, chat_id, msg_id, link_id)
+            message.reply_text(f"✅ Filename updated to:\n`{new_name}`", quote=True)
+            return
+
+        if retry_id and retry_id in retry_downloads:
+            retry_downloads[retry_id]["title"] = new_name
+            message.reply_text(f"✅ Filename set to:\n`{new_name}`\n⏳ Retrying download...", quote=True)
+            start_download_from_retry(client, message.chat.id, retry_id)
+            return
+
+    reply = message.reply_to_message
+    if reply and reply.reply_markup and reply.reply_markup.inline_keyboard:
+        for row in reply.reply_markup.inline_keyboard:
+            for btn in row:
+                if btn.callback_data:
+                    if btn.callback_data.startswith("dl:") or btn.callback_data.startswith("rename:"):
+                        link_id = btn.callback_data.split(":")[1]
+                        if link_id in links_store:
+                            links_store[link_id]["title"] = new_name
+                            update_format_selector(client, reply.chat.id, reply.id, link_id)
+                            message.reply_text(f"✅ Filename updated to:\n`{new_name}`", quote=True)
+                            return
+                    elif btn.callback_data.startswith("retry_dl:") or btn.callback_data.startswith("rename_dl:"):
+                        retry_id = btn.callback_data.split(":")[1]
+                        if retry_id in retry_downloads:
+                            retry_downloads[retry_id]["title"] = new_name
+                            message.reply_text(f"✅ Filename set to:\n`{new_name}`\n⏳ Retrying download...", quote=True)
+                            start_download_from_retry(client, message.chat.id, retry_id)
+                            return
+
+    message.reply_text("⚠️ Could not find an active link to rename. Please click the **✏️ Rename** button on the video message.", quote=True)
+
+# Handler for text messages (e.g. user input when renaming)
+@app.on_message(filters.text & ~filters.command(["start", "caption", "rename"]))
+def handle_text(client, message):
+    user_id = message.from_user.id if message.from_user else message.chat.id
+    if not is_user_allowed(user_id):
+        return
+
+    # Check for cancel
+    if message.text.strip().lower() in ["/cancel", "cancel"]:
+        if user_id in pending_renames:
+            pending_renames.pop(user_id, None)
+            message.reply_text("❌ Rename cancelled.", quote=True)
+            return
+
+    # If user is in pending renames, process the new filename
+    if user_id in pending_renames:
+        rename_info = pending_renames.pop(user_id)
+        raw_text = message.text.strip()
+        new_name = clean_filename(raw_text, max_len=120)
+
+        link_id = rename_info.get("link_id")
+        retry_id = rename_info.get("retry_id")
+
+        if link_id and link_id in links_store:
+            links_store[link_id]["title"] = new_name
+            chat_id = rename_info.get("chat_id")
+            msg_id = rename_info.get("message_id")
+            if chat_id and msg_id:
+                update_format_selector(client, chat_id, msg_id, link_id)
+            message.reply_text(f"✅ Filename updated to:\n`{new_name}`", quote=True)
+            return
+
+        if retry_id and retry_id in retry_downloads:
+            retry_downloads[retry_id]["title"] = new_name
+            message.reply_text(f"✅ Filename set to:\n`{new_name}`\n⏳ Starting download...", quote=True)
+            start_download_from_retry(client, message.chat.id, retry_id)
+            return
 
 def run_bot():
     app.start()

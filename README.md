@@ -15,6 +15,11 @@ A fast, feature-rich Telegram video downloader bot powered by [Pyrogram](https:/
 - 🎛️ **Resolution & Format Selector**:
   - Parses video formats and presents interactive buttons for available resolutions (1080p, 720p, 480p, etc.) and protocols.
   - Graceful fallback for direct files and single-stream URLs.
+- ✏️ **Filename Renaming & Length Protection**:
+  - Automatically detects long titles (`> 60` characters) and shows a notice with a **✏️ Rename (Too Long)** button.
+  - Interactive renaming via button or `/rename <new filename>` command before downloading.
+  - Automatic filesystem-safe sanitization and length capping to prevent OS `File name too long` (Errno 36 / WinError 206) errors.
+  - **🔄 Retry** & **✏️ Rename & Retry** callback buttons on any download errors.
 - 🛑 **Interactive Cancel Button**:
   - Cancel ongoing downloads on demand with a single tap.
 - 🔒 **User Whitelist / Access Control**:
@@ -137,7 +142,7 @@ pm2 restart tgdlbot
 
 ### Useful One-Liner for Server Updates:
 ```bash
-(cd ~/bots/yt-dlp-bot && git pull && pm2 restart tgdlbot && pm2 logs)
+(cd ~/bots/yt-dlp-bot && git pull && uv sync && pm2 restart tgdlbot && pm2 logs)
 ```
 
 ### Uploading Files up to 4GB (Telegram Premium)
