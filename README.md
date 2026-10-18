@@ -93,8 +93,6 @@ uv sync
 ### 4. Run the Bot
 ```bash
 uv run main.py
-# or
-uv run python yt_dlp_tgbot.py
 ```
 
 ---
@@ -147,7 +145,7 @@ pm2 restart tgdlbot
 
 ### Uploading Files up to 4GB (Telegram Premium)
 Standard Telegram bot accounts can upload files up to **2GB**. If using a bot associated with a Telegram Premium account or custom local Bot API server supporting 4GB:
-Update line 265 in [`yt_dlp_tgbot.py`](file:///c:/CODE/yt-dlp-bot/yt_dlp_tgbot.py):
+Update in [`downloader.py`](file:///c:/CODE/yt-dlp-bot/downloader.py):
 ```python
 if file_size > 4 * 1024 * 1024 * 1024:  # 4GB in bytes
 ```
