@@ -11,6 +11,7 @@ API_HASH = os.getenv("API_HASH") or None
 BOT_TOKEN = os.getenv("BOT_TOKEN") or None
 APP_TITLE = os.getenv("APP_TITLE") or "yt_dlp_bot"
 MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "5"))
+DEFAULT_MODE = os.getenv("DEFAULT_MODE", "normal").lower()
 
 # Allowed user IDs from environment (comma-separated, e.g. ALLOWED_IDS=123456,789012)
 allowed_ids_raw = os.getenv("ALLOWED_IDS", "")

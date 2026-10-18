@@ -15,3 +15,15 @@ retry_downloads = {}
 
 # user_id -> {"link_id": str, "retry_id": str, "prompt_msg_id": int, "chat_id": int, "message_id": int}
 pending_renames = {}
+
+# user_id -> "stream" | "normal"
+user_modes = {}
+
+from config import DEFAULT_MODE
+
+def get_user_mode(user_id):
+    return user_modes.get(user_id, DEFAULT_MODE)
+
+def set_user_mode(user_id, mode):
+    user_modes[user_id] = mode
+

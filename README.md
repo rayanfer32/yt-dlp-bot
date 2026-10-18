@@ -12,6 +12,12 @@ A fast, feature-rich Telegram video downloader bot powered by [Pyrogram](https:/
   - Displays live percentage, downloaded/total file size, transfer speed, and remaining ETA.
   - Smart throttling (3.5s interval) and rate-limit handling to avoid Telegram `FloodWait`.
   - Self-cleaning status message that updates in-place and removes itself once the video is delivered.
+- ⚡ **Stream Mode (Parallel Packet Upload)**:
+  - Download and upload packets of the file at the same time using a concurrent pipelined stream.
+  - Slashes total delivery time nearly in half compared to traditional sequential transfer.
+  - Dual real-time progress bars showing both download and upload progress and speeds simultaneously.
+  - Automatically delivers media as video when possible, with graceful fallback to document format if video stream headers are incomplete.
+  - Switch anytime via `/mode stream`, `/mode normal`, `/mode`, or with the interactive toggle button on format messages.
 - 🎛️ **Resolution & Format Selector**:
   - Parses video formats and presents interactive buttons for available resolutions (1080p, 720p, 480p, etc.) and protocols.
   - Graceful fallback for direct files and single-stream URLs.
@@ -107,6 +113,7 @@ uv run main.py
 | `APP_TITLE` | No | Pyrogram session file name (default: `yt_dlp_bot`). |
 | `ALLOWED_IDS`| No | Comma-separated list of Telegram user IDs permitted to use the bot. |
 | `MAX_CONCURRENT_DOWNLOADS` | No | Number of downloads permitted to run in parallel (default: `5`). |
+| `DEFAULT_MODE` | No | Default download/upload mode: `stream` (parallel) or `normal` (sequential) (default: `normal`). |
 
 ---
 
@@ -115,10 +122,12 @@ uv run main.py
 1. Open a chat with your bot on Telegram and send `/start`.
 2. Paste any supported video link or direct media URL.
 3. Choose your preferred resolution / format from the reply keyboard.
-4. Watch real-time download and upload progress indicators.
-5. Tap **Cancel Download** on any download progress message to cancel that specific task.
-6. The bot uploads the video directly into the chat with the original video title as caption, then cleans up temporary files.
-7. **Edit Caption**: Reply to any sent video with `/caption <new caption>` to instantly update its caption. The bot updates the caption and auto-deletes the command and confirmation after 3 seconds to keep your chat clean.
+4. **Mode Toggle**: Send `/mode stream` or `/mode normal` to set your preference, or tap the mode button on any video link message.
+5. Watch real-time download and upload progress indicators (in Stream Mode, both indicators move simultaneously!).
+6. Tap **Cancel Download** on any download progress message to cancel that specific task.
+7. The bot uploads the video directly into the chat with the original video title as caption, then cleans up temporary files.
+8. **Edit Caption**: Reply to any sent video with `/caption <new caption>` to instantly update its caption.
+9. **Rename**: Tap **✏️ Rename** on any format selection message or send `/rename <new filename>` to customize the filename before downloading.
 
 ---
 

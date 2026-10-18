@@ -9,7 +9,15 @@ from pyrogram.types import (
 )
 from config import is_user_allowed
 from utils import clean_filename
-from state import links_store, active_tasks, retry_downloads, pending_renames, executor
+from state import (
+    links_store,
+    active_tasks,
+    retry_downloads,
+    pending_renames,
+    executor,
+    get_user_mode,
+    set_user_mode,
+)
 from downloader import (
     process_link,
     update_format_selector,
@@ -22,7 +30,11 @@ def handle_start(client, message):
     user_id = message.from_user.id if message.from_user else message.chat.id
     if not is_user_allowed(user_id):
         return message.reply_text("You are not allowed to use this bot.", quote=True)
-    message.reply_text("👋 Send me any video link or direct download URL to get started!", quote=True)
+    message.reply_text(
+        "👋 Send me any video link or direct download URL to get started!\n\n"
+        "💡 **Tip:** Use `/mode` to switch between **⚡ Stream Mode** (parallel download & upload) and **📥 Normal Mode**.",
+        quote=True
+    )
 
 
 def handle_caption(client, message):
@@ -83,6 +95,47 @@ def handle_caption(client, message):
             pass
 
 
+def handle_mode(client, message):
+    user_id = message.from_user.id if message.from_user else message.chat.id
+    if not is_user_allowed(user_id):
+        return
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) > 1:
+        arg = parts[1].strip().lower()
+        if arg in ["stream", "pipe", "packet", "parallel"]:
+            set_user_mode(user_id, "stream")
+            return message.reply_text("✅ Mode set to ⚡ **Stream Mode** (Parallel download & upload).", quote=True)
+        elif arg in ["normal", "standard", "sequential"]:
+            set_user_mode(user_id, "normal")
+            return message.reply_text("✅ Mode set to 📥 **Normal Mode** (Sequential download then upload).", quote=True)
+        else:
+            return message.reply_text("⚠️ Unknown mode. Usage: `/mode stream` or `/mode normal`.", quote=True)
+
+    current_mode = get_user_mode(user_id)
+    mode_desc = (
+        "⚡ **Stream Mode (Parallel)**\n_Packets upload to Telegram in real-time as they download._"
+        if current_mode == "stream"
+        else "📥 **Normal Mode (Sequential)**\n_Downloads the complete file first, then uploads to Telegram._"
+    )
+
+    markup = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⚡ Stream Mode" + (" (Active)" if current_mode == "stream" else ""), callback_data="set_mode:stream"),
+            InlineKeyboardButton("📥 Normal Mode" + (" (Active)" if current_mode == "normal" else ""), callback_data="set_mode:normal")
+        ],
+        [InlineKeyboardButton("❌ Dismiss", callback_data="dismiss")]
+    ])
+
+    message.reply_text(
+        f"⚙️ **Download & Upload Mode Settings**\n\n"
+        f"Current: {mode_desc}\n\n"
+        f"Tap an option below to switch, or use `/mode stream` / `/mode normal`:",
+        reply_markup=markup,
+        quote=True
+    )
+
+
 def handle_link(client, message):
     chat_id = message.chat.id
     user_id = message.from_user.id if message.from_user else chat_id
@@ -96,7 +149,7 @@ def handle_link(client, message):
     link_match = re.search(r'https?://[^\s]+', message.text)
     link = link_match.group(0) if link_match else message.text.strip()
     wait_msg = message.reply_text("🔍 Fetching video info...", quote=True)
-    process_link(client, chat_id, link, wait_msg)
+    process_link(client, chat_id, link, wait_msg, user_id=user_id)
 
 
 def handle_callback(client, callback_query):
@@ -116,6 +169,29 @@ def handle_callback(client, callback_query):
         callback_query.answer("Dismissed.")
         return
 
+    if data.startswith("set_mode:"):
+        _, new_mode = data.split(":", 1)
+        set_user_mode(user_id, new_mode)
+        mode_label = "⚡ Stream Mode (Parallel)" if new_mode == "stream" else "📥 Normal Mode (Sequential)"
+        callback_query.answer(f"Switched to {mode_label}!")
+        try:
+            callback_query.message.edit_text(
+                f"✅ **Mode updated to:** `{mode_label}`\n\nYour future downloads will use this mode."
+            )
+        except Exception:
+            pass
+        return
+
+    if data.startswith("toggle_mode:"):
+        _, link_id = data.split(":", 1)
+        current = get_user_mode(user_id)
+        next_mode = "normal" if current == "stream" else "stream"
+        set_user_mode(user_id, next_mode)
+        mode_label = "⚡ Stream Mode" if next_mode == "stream" else "📥 Normal Mode"
+        callback_query.answer(f"Switched to {mode_label}!")
+        update_format_selector(client, chat_id, callback_query.message.id, link_id, user_id=user_id)
+        return
+
     if data.startswith("retry_link:"):
         _, link_id = data.split(":", 1)
         link_info = links_store.get(link_id)
@@ -129,7 +205,7 @@ def handle_callback(client, callback_query):
         except Exception:
             pass
 
-        process_link(client, chat_id, link_info["link"], callback_query.message, link_id=link_id)
+        process_link(client, chat_id, link_info["link"], callback_query.message, link_id=link_id, user_id=user_id)
         return
 
     if data.startswith("rename:"):
@@ -186,7 +262,7 @@ def handle_callback(client, callback_query):
             return
 
         callback_query.answer("🔄 Retrying download...")
-        start_download_from_retry(client, chat_id, retry_id, callback_query.message)
+        start_download_from_retry(client, chat_id, retry_id, callback_query.message, user_id=user_id)
         return
 
     if data.startswith("cancel:"):
@@ -255,7 +331,8 @@ def handle_callback(client, callback_query):
             title,
             task_folder,
             status_msg,
-            link_id
+            link_id,
+            user_id
         )
 
 
@@ -286,14 +363,14 @@ def handle_rename(client, message):
             chat_id = rename_info.get("chat_id")
             msg_id = rename_info.get("message_id")
             if chat_id and msg_id:
-                update_format_selector(client, chat_id, msg_id, link_id)
+                update_format_selector(client, chat_id, msg_id, link_id, user_id=user_id)
             message.reply_text(f"✅ Filename updated to:\n`{new_name}`", quote=True)
             return
 
         if retry_id and retry_id in retry_downloads:
             retry_downloads[retry_id]["title"] = new_name
             message.reply_text(f"✅ Filename set to:\n`{new_name}`\n⏳ Retrying download...", quote=True)
-            start_download_from_retry(client, message.chat.id, retry_id)
+            start_download_from_retry(client, message.chat.id, retry_id, user_id=user_id)
             return
 
     reply = message.reply_to_message
@@ -305,7 +382,7 @@ def handle_rename(client, message):
                         link_id = btn.callback_data.split(":")[1]
                         if link_id in links_store:
                             links_store[link_id]["title"] = new_name
-                            update_format_selector(client, reply.chat.id, reply.id, link_id)
+                            update_format_selector(client, reply.chat.id, reply.id, link_id, user_id=user_id)
                             message.reply_text(f"✅ Filename updated to:\n`{new_name}`", quote=True)
                             return
                     elif btn.callback_data.startswith("retry_dl:") or btn.callback_data.startswith("rename_dl:"):
@@ -313,7 +390,7 @@ def handle_rename(client, message):
                         if retry_id in retry_downloads:
                             retry_downloads[retry_id]["title"] = new_name
                             message.reply_text(f"✅ Filename set to:\n`{new_name}`\n⏳ Retrying download...", quote=True)
-                            start_download_from_retry(client, message.chat.id, retry_id)
+                            start_download_from_retry(client, message.chat.id, retry_id, user_id=user_id)
                             return
 
     message.reply_text("⚠️ Could not find an active link to rename. Please click the **✏️ Rename** button on the video message.", quote=True)
@@ -345,14 +422,14 @@ def handle_text(client, message):
             chat_id = rename_info.get("chat_id")
             msg_id = rename_info.get("message_id")
             if chat_id and msg_id:
-                update_format_selector(client, chat_id, msg_id, link_id)
+                update_format_selector(client, chat_id, msg_id, link_id, user_id=user_id)
             message.reply_text(f"✅ Filename updated to:\n`{new_name}`", quote=True)
             return
 
         if retry_id and retry_id in retry_downloads:
             retry_downloads[retry_id]["title"] = new_name
             message.reply_text(f"✅ Filename set to:\n`{new_name}`\n⏳ Starting download...", quote=True)
-            start_download_from_retry(client, message.chat.id, retry_id)
+            start_download_from_retry(client, message.chat.id, retry_id, user_id=user_id)
             return
 
 
@@ -360,6 +437,7 @@ def register_handlers(app: Client):
     app.on_message(filters.command("start"))(handle_start)
     app.on_message(filters.command("caption"))(handle_caption)
     app.on_message(filters.command("rename"))(handle_rename)
+    app.on_message(filters.command("mode"))(handle_mode)
     app.on_message(filters.regex(r'https?://[^\s]+'))(handle_link)
-    app.on_message(filters.text & ~filters.command(["start", "caption", "rename"]))(handle_text)
+    app.on_message(filters.text & ~filters.command(["start", "caption", "rename", "mode"]))(handle_text)
     app.on_callback_query()(handle_callback)
