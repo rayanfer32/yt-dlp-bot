@@ -15,3 +15,6 @@ __pycache__/
 
 # Downloaded files
 downloads/
+
+# Log files
+*.log

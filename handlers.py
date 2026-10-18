@@ -14,7 +14,7 @@ from state import (
     active_tasks,
     retry_downloads,
     pending_renames,
-    executor,
+    submit_task,
     get_user_mode,
     set_user_mode,
 )
@@ -24,11 +24,16 @@ from downloader import (
     start_download_from_retry,
     run_download_task,
 )
+from logger import setup_logger
+
+logger = setup_logger("handlers")
 
 
 def handle_start(client, message):
     user_id = message.from_user.id if message.from_user else message.chat.id
+    logger.info(f"User {user_id} in chat {message.chat.id} sent /start")
     if not is_user_allowed(user_id):
+        logger.warning(f"Unauthorized access attempt by user {user_id}")
         return message.reply_text("You are not allowed to use this bot.", quote=True)
     message.reply_text(
         "👋 Send me any video link or direct download URL to get started!\n\n"
@@ -75,6 +80,7 @@ def handle_caption(client, message):
         return
 
     new_caption = parts[1].strip()
+    logger.info(f"User {user_id} updating caption on message {reply.id} to '{new_caption[:40]}...'")
 
     try:
         reply.edit_caption(new_caption)
@@ -86,6 +92,7 @@ def handle_caption(client, message):
         except Exception:
             pass
     except Exception as e:
+        logger.error(f"Failed to update caption: {e}", exc_info=True)
         err_msg = message.reply_text(f"❌ Failed to update caption: {e}", quote=True)
         time.sleep(4)
         try:
@@ -100,14 +107,17 @@ def handle_mode(client, message):
     if not is_user_allowed(user_id):
         return
 
+    logger.info(f"User {user_id} called /mode with text: '{message.text}'")
     parts = message.text.split(maxsplit=1)
     if len(parts) > 1:
         arg = parts[1].strip().lower()
         if arg in ["stream", "pipe", "packet", "parallel"]:
             set_user_mode(user_id, "stream")
+            logger.info(f"User {user_id} set mode to stream via command")
             return message.reply_text("✅ Mode set to ⚡ **Stream Mode** (Parallel download & upload).", quote=True)
         elif arg in ["normal", "standard", "sequential"]:
             set_user_mode(user_id, "normal")
+            logger.info(f"User {user_id} set mode to normal via command")
             return message.reply_text("✅ Mode set to 📥 **Normal Mode** (Sequential download then upload).", quote=True)
         else:
             return message.reply_text("⚠️ Unknown mode. Usage: `/mode stream` or `/mode normal`.", quote=True)
@@ -141,6 +151,7 @@ def handle_link(client, message):
     user_id = message.from_user.id if message.from_user else chat_id
 
     if not is_user_allowed(user_id):
+        logger.warning(f"Unauthorized link receipt from user {user_id}")
         return
 
     # Clear any pending rename if user sends a new link
@@ -148,192 +159,213 @@ def handle_link(client, message):
 
     link_match = re.search(r'https?://[^\s]+', message.text)
     link = link_match.group(0) if link_match else message.text.strip()
+    logger.info(f"User {user_id} in chat {chat_id} submitted link: {link}")
     wait_msg = message.reply_text("🔍 Fetching video info...", quote=True)
     process_link(client, chat_id, link, wait_msg, user_id=user_id)
 
 
 def handle_callback(client, callback_query):
-    data = callback_query.data
-    chat_id = callback_query.message.chat.id
-    user_id = callback_query.from_user.id if callback_query.from_user else chat_id
+    try:
+        data = callback_query.data
+        chat_id = callback_query.message.chat.id
+        user_id = callback_query.from_user.id if callback_query.from_user else chat_id
 
-    if not is_user_allowed(user_id):
-        callback_query.answer("You are not authorized to use this bot.", show_alert=True)
-        return
+        logger.debug(f"Received callback query '{data}' from user {user_id} in chat {chat_id}")
 
-    if data.startswith("dismiss"):
-        try:
-            callback_query.message.delete()
-        except Exception:
-            pass
-        callback_query.answer("Dismissed.")
-        return
-
-    if data.startswith("set_mode:"):
-        _, new_mode = data.split(":", 1)
-        set_user_mode(user_id, new_mode)
-        mode_label = "⚡ Stream Mode (Parallel)" if new_mode == "stream" else "📥 Normal Mode (Sequential)"
-        callback_query.answer(f"Switched to {mode_label}!")
-        try:
-            callback_query.message.edit_text(
-                f"✅ **Mode updated to:** `{mode_label}`\n\nYour future downloads will use this mode."
-            )
-        except Exception:
-            pass
-        return
-
-    if data.startswith("toggle_mode:"):
-        _, link_id = data.split(":", 1)
-        current = get_user_mode(user_id)
-        next_mode = "normal" if current == "stream" else "stream"
-        set_user_mode(user_id, next_mode)
-        mode_label = "⚡ Stream Mode" if next_mode == "stream" else "📥 Normal Mode"
-        callback_query.answer(f"Switched to {mode_label}!")
-        update_format_selector(client, chat_id, callback_query.message.id, link_id, user_id=user_id)
-        return
-
-    if data.startswith("retry_link:"):
-        _, link_id = data.split(":", 1)
-        link_info = links_store.get(link_id)
-        if not link_info or not link_info.get("link"):
-            callback_query.answer("⚠️ Session expired. Please send the link again.", show_alert=True)
+        if not is_user_allowed(user_id):
+            logger.warning(f"Unauthorized callback from user {user_id}")
+            callback_query.answer("You are not authorized to use this bot.", show_alert=True)
             return
 
-        callback_query.answer("🔄 Retrying...")
-        try:
-            callback_query.message.edit_text("🔍 Retrying: Fetching video info...")
-        except Exception:
-            pass
-
-        process_link(client, chat_id, link_info["link"], callback_query.message, link_id=link_id, user_id=user_id)
-        return
-
-    if data.startswith("rename:"):
-        _, link_id = data.split(":", 1)
-        link_info = links_store.get(link_id)
-        if not link_info:
-            callback_query.answer("⚠️ Session expired. Please send the link again.", show_alert=True)
-            return
-
-        callback_query.answer()
-        current_title = link_info.get("title", "Video")
-        prompt_msg = callback_query.message.reply_text(
-            f"✏️ **Rename Video Filename**\n\n"
-            f"Current filename ({len(current_title)} chars):\n`{current_title}`\n\n"
-            f"💬 Send your new filename below (or `/cancel` to abort):",
-            quote=True
-        )
-        pending_renames[user_id] = {
-            "link_id": link_id,
-            "prompt_msg_id": prompt_msg.id,
-            "chat_id": chat_id,
-            "message_id": callback_query.message.id
-        }
-        return
-
-    if data.startswith("rename_dl:"):
-        _, retry_id = data.split(":", 1)
-        retry_info = retry_downloads.get(retry_id)
-        if not retry_info:
-            callback_query.answer("⚠️ Session expired. Please send the link again.", show_alert=True)
-            return
-
-        callback_query.answer()
-        current_title = retry_info.get("title", "Video")
-        prompt_msg = callback_query.message.reply_text(
-            f"✏️ **Rename & Retry Download**\n\n"
-            f"Current filename ({len(current_title)} chars):\n`{current_title}`\n\n"
-            f"💬 Send your new filename below (or `/cancel` to abort):",
-            quote=True
-        )
-        pending_renames[user_id] = {
-            "retry_id": retry_id,
-            "prompt_msg_id": prompt_msg.id,
-            "chat_id": chat_id,
-            "message_id": callback_query.message.id
-        }
-        return
-
-    if data.startswith("retry_dl:"):
-        _, retry_id = data.split(":", 1)
-        retry_info = retry_downloads.get(retry_id)
-        if not retry_info:
-            callback_query.answer("⚠️ Session expired. Please send the link again.", show_alert=True)
-            return
-
-        callback_query.answer("🔄 Retrying download...")
-        start_download_from_retry(client, chat_id, retry_id, callback_query.message, user_id=user_id)
-        return
-
-    if data.startswith("cancel:"):
-        _, task_id = data.split(":", 1)
-        task = active_tasks.get(task_id)
-        if task:
-            task["cancelled"] = True
-            callback_query.answer("Download cancelled.")
+        if data.startswith("dismiss"):
             try:
-                callback_query.message.edit_text(f"🚫 **Download cancelled by user.**\n`{task.get('title', 'Video')}`")
-            except Exception as e:
-                print(f"Cancel edit error: {e}")
-        else:
-            callback_query.answer("Download not found or already finished.", show_alert=True)
-        return
-
-    if data.startswith("dl:"):
-        try:
-            _, link_id, idx_str = data.split(":", 2)
-            idx = int(idx_str)
-        except Exception:
-            callback_query.answer("Invalid request.", show_alert=True)
+                callback_query.message.delete()
+            except Exception:
+                pass
+            callback_query.answer("Dismissed.")
             return
 
-        link_info = links_store.get(link_id)
-        if not link_info or idx >= len(link_info["formats"]):
-            callback_query.answer("⚠️ Session expired. Please send the link again.", show_alert=True)
+        if data.startswith("set_mode:"):
+            _, new_mode = data.split(":", 1)
+            set_user_mode(user_id, new_mode)
+            mode_label = "⚡ Stream Mode (Parallel)" if new_mode == "stream" else "📥 Normal Mode (Sequential)"
+            logger.info(f"User {user_id} updated default mode to {new_mode}")
+            callback_query.answer(f"Switched to {mode_label}!")
+            try:
+                callback_query.message.edit_text(
+                    f"✅ **Mode updated to:** `{mode_label}`\n\nYour future downloads will use this mode."
+                )
+            except Exception:
+                pass
             return
 
-        btn_text, format_id = link_info["formats"][idx]
-        link = link_info["link"]
-        title = link_info["title"]
+        if data.startswith("toggle_mode:"):
+            _, link_id = data.split(":", 1)
+            current = get_user_mode(user_id)
+            next_mode = "normal" if current == "stream" else "stream"
+            set_user_mode(user_id, next_mode)
+            mode_label = "⚡ Stream Mode" if next_mode == "stream" else "📥 Normal Mode"
+            logger.info(f"User {user_id} toggled per-link mode to {next_mode} for link_id {link_id}")
+            callback_query.answer(f"Switched to {mode_label}!")
+            update_format_selector(client, chat_id, callback_query.message.id, link_id, user_id=user_id)
+            return
 
-        callback_query.answer(f"Starting {btn_text}...")
+        if data.startswith("retry_link:"):
+            _, link_id = data.split(":", 1)
+            link_info = links_store.get(link_id)
+            if not link_info or not link_info.get("link"):
+                callback_query.answer("⚠️ Session expired. Please send the link again.", show_alert=True)
+                return
 
-        # Create unique task for this download
-        task_id = uuid.uuid4().hex[:8]
-        task_folder = f"downloads/{chat_id}/{task_id}"
-        os.makedirs(task_folder, exist_ok=True)
+            logger.info(f"User {user_id} retrying link fetch for link_id {link_id}")
+            callback_query.answer("🔄 Retrying...")
+            try:
+                callback_query.message.edit_text("🔍 Retrying: Fetching video info...")
+            except Exception:
+                pass
 
-        active_tasks[task_id] = {
-            "cancelled": False,
-            "title": title,
-            "chat_id": chat_id,
-            "folder": task_folder
-        }
+            process_link(client, chat_id, link_info["link"], callback_query.message, link_id=link_id, user_id=user_id)
+            return
 
-        cancel_markup = InlineKeyboardMarkup([[
-            InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel:{task_id}")
-        ]])
+        if data.startswith("rename:"):
+            _, link_id = data.split(":", 1)
+            link_info = links_store.get(link_id)
+            if not link_info:
+                callback_query.answer("⚠️ Session expired. Please send the link again.", show_alert=True)
+                return
 
-        status_msg = callback_query.message.reply_text(
-            f"⏳ **Starting download:** {title[:40]}...\n`[□□□□□□□□□□]` **0.0%**",
-            reply_markup=cancel_markup,
-            quote=True
-        )
+            callback_query.answer()
+            current_title = link_info.get("title", "Video")
+            prompt_msg = callback_query.message.reply_text(
+                f"✏️ **Current name:** `{current_title}`\n\n"
+                f"Send me the new title/filename for this download, or send `/cancel` to abort.",
+                quote=True
+            )
+            pending_renames[user_id] = {
+                "link_id": link_id,
+                "retry_id": None,
+                "prompt_msg_id": prompt_msg.id,
+                "chat_id": chat_id,
+                "message_id": callback_query.message.id
+            }
+            logger.info(f"User {user_id} requested rename for link_id {link_id}")
+            return
 
-        # Submit task to thread pool for concurrent execution
-        executor.submit(
-            run_download_task,
-            client,
-            chat_id,
-            task_id,
-            link,
-            format_id,
-            title,
-            task_folder,
-            status_msg,
-            link_id,
-            user_id
-        )
+        if data.startswith("rename_dl:"):
+            _, retry_id = data.split(":", 1)
+            retry_info = retry_downloads.get(retry_id)
+            if not retry_info:
+                callback_query.answer("⚠️ Session expired. Please send the link again.", show_alert=True)
+                return
+
+            callback_query.answer()
+            current_title = retry_info.get("title", "Video")
+            prompt_msg = callback_query.message.reply_text(
+                f"✏️ **Current name:** `{current_title}`\n\n"
+                f"Send me the new title/filename for this retry download, or send `/cancel` to abort.",
+                quote=True
+            )
+            pending_renames[user_id] = {
+                "link_id": None,
+                "retry_id": retry_id,
+                "prompt_msg_id": prompt_msg.id,
+                "chat_id": chat_id,
+                "message_id": callback_query.message.id
+            }
+            logger.info(f"User {user_id} requested rename for retry_id {retry_id}")
+            return
+
+        if data.startswith("retry_dl:"):
+            _, retry_id = data.split(":", 1)
+            retry_info = retry_downloads.get(retry_id)
+            if not retry_info:
+                callback_query.answer("⚠️ Session expired. Please send the link again.", show_alert=True)
+                return
+
+            logger.info(f"User {user_id} retrying download for retry_id {retry_id}")
+            callback_query.answer("🔄 Retrying download...")
+            start_download_from_retry(client, chat_id, retry_id, callback_query.message, user_id=user_id)
+            return
+
+        if data.startswith("cancel:"):
+            _, task_id = data.split(":", 1)
+            task = active_tasks.get(task_id)
+            if task:
+                task["cancelled"] = True
+                logger.info(f"User {user_id} marked task {task_id} as cancelled")
+                callback_query.answer("Download cancelled.")
+                try:
+                    callback_query.message.edit_text(f"🚫 **Download cancelled by user.**\n`{task.get('title', 'Video')}`")
+                except Exception as e:
+                    logger.debug(f"Cancel edit notice: {e}")
+            else:
+                callback_query.answer("Download not found or already finished.", show_alert=True)
+            return
+
+        if data.startswith("dl:"):
+            try:
+                _, link_id, idx_str = data.split(":", 2)
+                idx = int(idx_str)
+            except Exception:
+                callback_query.answer("Invalid request.", show_alert=True)
+                return
+
+            link_info = links_store.get(link_id)
+            if not link_info or idx >= len(link_info["formats"]):
+                callback_query.answer("⚠️ Session expired. Please send the link again.", show_alert=True)
+                return
+
+            btn_text, format_id = link_info["formats"][idx]
+            link = link_info["link"]
+            title = link_info["title"]
+
+            callback_query.answer(f"Starting {btn_text}...")
+
+            # Create unique task for this download
+            task_id = uuid.uuid4().hex[:8]
+            task_folder = f"downloads/{chat_id}/{task_id}"
+            os.makedirs(task_folder, exist_ok=True)
+
+            active_tasks[task_id] = {
+                "cancelled": False,
+                "title": title,
+                "chat_id": chat_id,
+                "folder": task_folder
+            }
+
+            cancel_markup = InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Cancel Download", callback_data=f"cancel:{task_id}")
+            ]])
+
+            status_msg = callback_query.message.reply_text(
+                f"⏳ **Starting download:** {title[:40]}...\n`[□□□□□□□□□□]` **0.0%**",
+                reply_markup=cancel_markup,
+                quote=True
+            )
+
+            mode = get_user_mode(user_id)
+            logger.info(
+                f"[{task_id}] Submitting download task for '{title}' (format={format_id}, "
+                f"mode={mode.upper()}, user={user_id})"
+            )
+
+            # Submit task to thread pool with crash logging
+            submit_task(
+                run_download_task,
+                client,
+                chat_id,
+                task_id,
+                link,
+                format_id,
+                title,
+                task_folder,
+                status_msg,
+                link_id,
+                user_id
+            )
+
+    except Exception as e:
+        logger.exception(f"Unhandled exception in handle_callback: {e}")
 
 
 def handle_rename(client, message):
@@ -352,6 +384,7 @@ def handle_rename(client, message):
         return
 
     new_name = clean_filename(parts[1].strip(), max_len=120)
+    logger.info(f"User {user_id} invoked /rename with new_name='{new_name}'")
 
     if user_id in pending_renames:
         rename_info = pending_renames.pop(user_id)
@@ -406,6 +439,7 @@ def handle_text(client, message):
         if user_id in pending_renames:
             pending_renames.pop(user_id, None)
             message.reply_text("❌ Rename cancelled.", quote=True)
+            logger.info(f"User {user_id} cancelled pending rename")
             return
 
     # If user is in pending renames, process the new filename
@@ -413,6 +447,7 @@ def handle_text(client, message):
         rename_info = pending_renames.pop(user_id)
         raw_text = message.text.strip()
         new_name = clean_filename(raw_text, max_len=120)
+        logger.info(f"User {user_id} completed pending rename with '{new_name}'")
 
         link_id = rename_info.get("link_id")
         retry_id = rename_info.get("retry_id")
@@ -434,6 +469,7 @@ def handle_text(client, message):
 
 
 def register_handlers(app: Client):
+    logger.info("Registering bot message and callback query handlers...")
     app.on_message(filters.command("start"))(handle_start)
     app.on_message(filters.command("caption"))(handle_caption)
     app.on_message(filters.command("rename"))(handle_rename)
@@ -441,3 +477,4 @@ def register_handlers(app: Client):
     app.on_message(filters.regex(r'https?://[^\s]+'))(handle_link)
     app.on_message(filters.text & ~filters.command(["start", "caption", "rename", "mode"]))(handle_text)
     app.on_callback_query()(handle_callback)
+    logger.info("All handlers registered successfully.")

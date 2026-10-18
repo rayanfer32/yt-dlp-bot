@@ -2,6 +2,10 @@ from pyrogram import Client, idle
 from config import API_ID, API_HASH, BOT_TOKEN, APP_TITLE, allowed_ids
 from handlers import register_handlers
 
+from logger import setup_logger
+
+logger = setup_logger("main")
+
 # Initialize Pyrogram client
 app = Client(APP_TITLE, api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
@@ -10,16 +14,21 @@ register_handlers(app)
 
 
 def run_bot():
+    logger.info("Initializing and starting bot...")
     app.start()
     me = app.get_me()
-    print(f"Bot started as @{me.username or me.id}")
+    logger.info(f"Bot started successfully as @{me.username or me.id} (ID: {me.id})")
     for uid in allowed_ids:
         try:
             app.send_message(uid, "🟢 Bot started successfully")
+            logger.debug(f"Startup message sent to allowed user {uid}")
         except Exception as e:
-            print(f"Could not send startup message to {uid}: {e}")
+            logger.warning(f"Could not send startup message to {uid}: {e}")
+    logger.info("Bot is running and listening for updates (idle)...")
     idle()
+    logger.info("Stopping bot...")
     app.stop()
+    logger.info("Bot stopped cleanly.")
 
 
 def main():
