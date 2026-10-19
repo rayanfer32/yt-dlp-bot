@@ -20,6 +20,7 @@ from state import (
     set_user_mode
 )
 from logger import setup_logger
+from config import get_cookie_file
 
 logger = setup_logger("downloader")
 
@@ -267,10 +268,14 @@ def process_link(client, chat_id, link, msg_to_edit, link_id=None, user_id=None)
         if user_id:
             links_store[link_id]["user_id"] = user_id
 
+    cookie_file = get_cookie_file()
     ydl_opts = {
         'quiet': True,
         'no_warnings': True
     }
+    if cookie_file:
+        ydl_opts['cookiefile'] = cookie_file
+        logger.debug(f"[{link_id}] Using cookies from: {cookie_file}")
     try:
         logger.debug(f"[{link_id}] Extracting info with yt-dlp...")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -510,6 +515,7 @@ def run_download_task(client, chat_id, task_id, link, format_id, title, task_fol
                 logger.debug(f"[{task_id}] Postprocessor updated filepath: {dl_state['file_path']}")
 
     try:
+        cookie_file = get_cookie_file()
         ydl_opts = {
             'format': format_id,
             'outtmpl': f'{task_folder}/{safe_title}.%(ext)s',
@@ -519,6 +525,9 @@ def run_download_task(client, chat_id, task_id, link, format_id, title, task_fol
             'quiet': True,
             'no_warnings': True
         }
+        if cookie_file:
+            ydl_opts['cookiefile'] = cookie_file
+            logger.info(f"[{task_id}] Using cookies from: {cookie_file}")
 
         # -----------------------------------------------------------------
         # STREAM MODE: Concurrent Download & Upload

@@ -1,5 +1,6 @@
 # start bot once
-pm2 start "uv run main.py" --name tgdlbot
+# 2. Start Python directly with main.py
+pm2 start .venv/bin/python --name tgdlbot -- main.py
 
 # update and restart bot
 (cd ~/bots/yt-dlp-bot && git pull && uv sync && pm2 restart tgdlbot && pm2 logs tgdlbot)

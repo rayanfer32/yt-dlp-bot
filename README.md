@@ -114,6 +114,7 @@ uv run main.py
 | `ALLOWED_IDS`| No | Comma-separated list of Telegram user IDs permitted to use the bot. |
 | `MAX_CONCURRENT_DOWNLOADS` | No | Number of downloads permitted to run in parallel (default: `5`). |
 | `DEFAULT_MODE` | No | Default download/upload mode: `stream` (parallel) or `normal` (sequential) (default: `normal`). |
+| `COOKIES_FILE` | No | Path to cookies file (default: `cookies.txt` in project root if present). |
 
 ---
 
