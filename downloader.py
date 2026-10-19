@@ -271,11 +271,18 @@ def process_link(client, chat_id, link, msg_to_edit, link_id=None, user_id=None)
     cookie_file = get_cookie_file()
     ydl_opts = {
         'quiet': True,
-        'no_warnings': True
+        'no_warnings': True,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'web']
+            }
+        }
     }
     if cookie_file:
         ydl_opts['cookiefile'] = cookie_file
-        logger.debug(f"[{link_id}] Using cookies from: {cookie_file}")
+        logger.info(f"[{link_id}] Using cookies from: {cookie_file}")
+    else:
+        logger.warning(f"[{link_id}] No cookies file found. Proceeding without cookies.")
     try:
         logger.debug(f"[{link_id}] Extracting info with yt-dlp...")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -523,11 +530,18 @@ def run_download_task(client, chat_id, task_id, link, format_id, title, task_fol
             'postprocessor_hooks': [ydl_postprocessor_hook],
             'nopart': True,
             'quiet': True,
-            'no_warnings': True
+            'no_warnings': True,
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android', 'web']
+                }
+            }
         }
         if cookie_file:
             ydl_opts['cookiefile'] = cookie_file
             logger.info(f"[{task_id}] Using cookies from: {cookie_file}")
+        else:
+            logger.warning(f"[{task_id}] No cookies file found. Proceeding without cookies.")
 
         # -----------------------------------------------------------------
         # STREAM MODE: Concurrent Download & Upload
